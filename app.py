@@ -9,9 +9,9 @@ from datetime import datetime, time as dtime
 from flask import Flask, jsonify, request, render_template
 
 # ── 環境變數 ──────────────────────────────────────────────────────────
-PORT      = int(os.environ.get('PORT', 8080))
-DATA_DIR  = os.environ.get('DATA_DIR', os.path.join(os.path.dirname(__file__), 'data'))
-LINE_ENV  = os.environ.get('LINE_NOTIFY_TOKEN', '')
+PORT        = int(os.environ.get('PORT', 8080))
+DATA_DIR    = os.environ.get('DATA_DIR', os.path.join(os.path.dirname(__file__), 'data'))
+NTFY_TOPIC  = os.environ.get('NTFY_TOPIC', '')
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -303,33 +303,30 @@ def load_config() -> dict:
         return json.load(f)
 
 
-def _get_token() -> str:
-    if LINE_ENV:
-        return LINE_ENV
-    return load_config().get("line_notify_token", "")
-
-
-def send_line(token: str, message: str) -> bool:
+def send_ntfy(title: str, message: str, priority: str = "default") -> bool:
+    topic = NTFY_TOPIC or load_config().get("ntfy_topic", "")
+    if not topic:
+        return False
     try:
         r = requests.post(
-            "https://notify-api.line.me/api/notify",
-            headers={"Authorization": f"Bearer {token}"},
-            data={"message": message}, timeout=10,
+            f"https://ntfy.sh/{topic}",
+            data=message.encode("utf-8"),
+            headers={"Title": title, "Priority": priority, "Tags": "chart_increasing"},
+            timeout=10,
         )
         return r.status_code == 200
     except Exception as e:
-        log.error(f"LINE 通知失敗：{e}")
+        log.error(f"ntfy 通知失敗：{e}")
         return False
 
 
-def notify(token: str, alert_key: str, message: str):
+def notify(token: str, alert_key: str, message: str, title: str = "📈 台股監控", priority: str = "default"):
     now_ts = time.time()
     if now_ts - _notified.get(alert_key, 0) < NOTIFY_COOLDOWN_SEC:
         return
     _notified[alert_key] = now_ts
     log.info(f"  ➜ 推播：{message[:60]}…")
-    if token and token != "YOUR_LINE_NOTIFY_TOKEN_HERE":
-        send_line(token, f"\n{message}")
+    send_ntfy(title, message, priority)
 
 
 def check_stock(code: str, scfg: dict, token: str, price: float):
@@ -352,14 +349,14 @@ def check_stock(code: str, scfg: dict, token: str, price: float):
         if holding:
             holding_note = (f"\n── 你的持倉 ──\n"
                             f"持有 {holding['shares']} 股  均價 {holding['avg_cost']:,.0f} 元")
-        message = (f"{icon} {name}（{code}）\n{title}\n{desc}\n"
-                   f"{cond.get('label','')}{holding_note}\n⏰ {now_s}")
-        notify(token, f"{code}_{ctype}_{target}", message)
+        body = (f"{desc}\n{cond.get('label','')}{holding_note}\n⏰ {now_s}")
+        ntfy_priority = "urgent" if ctype == "stop_loss" else "high"
+        notify(token, f"{code}_{ctype}_{target}", body,
+               title=f"{icon} {name}（{code}）{title}", priority=ntfy_priority)
 
 
 def run_check():
     cfg   = load_config()
-    token = _get_token()
     now_s = datetime.now(TW_TZ).strftime("%H:%M")
     if not is_market_hours():
         log.info(f"[{now_s}] 非交易時段，等待中…")
@@ -374,7 +371,7 @@ def run_check():
             continue
         prices[code] = p
         log.info(f"  {scfg.get('name',code)} ({code})：{p:,.0f} 元")
-        check_stock(code, scfg, token, p)
+        check_stock(code, scfg, "", p)
     summary = get_portfolio_summary(prices)
     now = datetime.now(TW_TZ)
     if now.minute < 6:
@@ -385,7 +382,8 @@ def run_check():
                          f" | {'▲' if r['pnl']>=0 else '▼'}{abs(r['pnl']):,.0f}元({r['pnl_pct']:+.1f}%)")
         lines.append(f"  現金：{summary['cash']:,.0f} 元")
         lines.append(f"  總資產：{summary['total_assets']:,.0f} 元")
-        notify(token, f"portfolio_hourly_{now.hour}", "\n".join(lines))
+        notify("", f"portfolio_hourly_{now.hour}", "\n".join(lines),
+               title="📊 每小時持倉摘要")
 
 
 def _monitor_thread():

@@ -320,9 +320,10 @@ def send_ntfy(title: str, message: str, priority: str = "default") -> bool:
         return False
 
 
-def notify(token: str, alert_key: str, message: str, title: str = "📈 台股監控", priority: str = "default"):
+def notify(token: str, alert_key: str, message: str, title: str = "📈 台股監控",
+           priority: str = "default", cooldown: int = NOTIFY_COOLDOWN_SEC):
     now_ts = time.time()
-    if now_ts - _notified.get(alert_key, 0) < NOTIFY_COOLDOWN_SEC:
+    if now_ts - _notified.get(alert_key, 0) < cooldown:
         return
     _notified[alert_key] = now_ts
     log.info(f"  ➜ 推播：{message[:60]}…")
@@ -350,9 +351,14 @@ def check_stock(code: str, scfg: dict, token: str, price: float):
             holding_note = (f"\n── 你的持倉 ──\n"
                             f"持有 {holding['shares']} 股  均價 {holding['avg_cost']:,.0f} 元")
         body = (f"{desc}\n{cond.get('label','')}{holding_note}\n⏰ {now_s}")
-        ntfy_priority = "urgent" if ctype == "stop_loss" else "high"
-        notify(token, f"{code}_{ctype}_{target}", body,
-               title=f"{icon} {name}（{code}）{title}", priority=ntfy_priority)
+        if ctype == "stop_loss":
+            notify(token, f"{code}_{ctype}_{target}", body,
+                   title=f"{icon} {name}（{code}）{title}",
+                   priority="urgent", cooldown=300)   # 每 5 分鐘一直推
+        else:
+            notify(token, f"{code}_{ctype}_{target}", body,
+                   title=f"{icon} {name}（{code}）{title}",
+                   priority="high", cooldown=NOTIFY_COOLDOWN_SEC)
 
 
 def run_check():

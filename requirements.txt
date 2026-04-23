@@ -1,0 +1,6 @@
+flask>=3.0
+requests>=2.31
+yfinance>=0.2
+schedule>=1.2
+pytz>=2024.1
+gunicorn>=22.0

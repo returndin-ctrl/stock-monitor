@@ -1,51 +1,42 @@
 #!/usr/bin/env python3
 """
 台股監控 Web App（雲端版）
-部署到 Railway，手機隨時可用，筆電不需開著
+部署到 Railway，以技術指標＋價格位置綜合判斷買賣時機
 """
 
 import sys, os, time, json, threading, logging, requests, schedule, pytz
+import pandas as pd
+import yfinance as yf
 from datetime import datetime, time as dtime
 from flask import Flask, jsonify, request, render_template
 
 # ── 環境變數 ──────────────────────────────────────────────────────────
-PORT        = int(os.environ.get('PORT', 8080))
-DATA_DIR    = os.environ.get('DATA_DIR', os.path.join(os.path.dirname(__file__), 'data'))
-NTFY_TOPIC  = os.environ.get('NTFY_TOPIC', '')
+PORT       = int(os.environ.get('PORT', 8080))
+DATA_DIR   = os.environ.get('DATA_DIR', os.path.join(os.path.dirname(__file__), 'data'))
+NTFY_TOPIC = os.environ.get('NTFY_TOPIC', '')
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
 PORTFOLIO_FILE = os.path.join(DATA_DIR, 'portfolio.json')
 CONFIG_FILE    = os.path.join(DATA_DIR, 'config.json')
 
-# ── 預設 config（首次啟動時寫入）────────────────────────────────────
 DEFAULT_CONFIG = {
-    "line_notify_token": "",
-    "check_interval_minutes": 5,
+    "ntfy_topic": "",
+    "check_interval_minutes": 1,
+    "buy_threshold": 3,
+    "sell_threshold": 3,
     "stocks": {
         "2330": {
             "name": "台積電",
             "budget": 50000,
-            "conditions": [
-                {"type": "buy_below",  "price": 2000, "shares": 24,
-                 "label": "買進訊號：建議買入 24 股零股（約 48,000 元）"},
-                {"type": "sell_above", "price": 2200,
-                 "label": "停利訊號：建議賣出，預估獲利 +4,800 元"},
-                {"type": "stop_loss",  "price": 1920,
-                 "label": "停損警報：建議立即賣出，控制虧損在 -3,800 元內"}
-            ]
+            "support_price": 1760,
+            "resistance_price": 2180
         },
         "2408": {
             "name": "南亞科",
             "budget": 50000,
-            "conditions": [
-                {"type": "buy_below",  "price": 190, "shares": 260,
-                 "label": "買進訊號：建議買入 260 股零股（約 49,400 元）"},
-                {"type": "sell_above", "price": 240,
-                 "label": "停利訊號：建議賣出，預估獲利 +13,000 元"},
-                {"type": "stop_loss",  "price": 175,
-                 "label": "停損警報：建議立即賣出"}
-            ]
+            "support_price": 198,
+            "resistance_price": 249
         }
     }
 }
@@ -67,7 +58,7 @@ log = logging.getLogger(__name__)
 # 持倉管理
 # ══════════════════════════════════════════════════════════════════════
 
-TW_TZ = pytz.timezone('Asia/Taipei')
+TW_TZ         = pytz.timezone('Asia/Taipei')
 BUY_FEE_RATE  = 0.001425
 SELL_FEE_RATE = 0.001425
 SELL_TAX_RATE = 0.003
@@ -98,6 +89,11 @@ def _now_str() -> str:
     return datetime.now(TW_TZ).strftime("%Y/%m/%d %H:%M")
 
 
+def load_config() -> dict:
+    with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
 def set_cash(amount: float) -> dict:
     data = _load()
     data["cash"] = amount
@@ -105,15 +101,13 @@ def set_cash(amount: float) -> dict:
     return data
 
 
-def buy(stock_code: str, stock_name: str, shares: int, price: float) -> dict:
+def pf_buy(stock_code: str, stock_name: str, shares: int, price: float) -> dict:
     data  = _load()
     gross = shares * price
     fee   = _fee(gross, is_sell=False)
     total = gross + fee
-
     if total > data["cash"]:
         raise ValueError(f"現金不足！需要 {total:,.0f} 元，帳戶只有 {data['cash']:,.0f} 元")
-
     h = data["holdings"].get(stock_code, {
         "name": stock_name, "shares": 0, "avg_cost": 0.0, "total_cost": 0.0
     })
@@ -134,20 +128,18 @@ def buy(stock_code: str, stock_name: str, shares: int, price: float) -> dict:
             "total": total, "cash_left": data["cash"]}
 
 
-def sell(stock_code: str, shares: int, price: float) -> dict:
+def pf_sell(stock_code: str, shares: int, price: float) -> dict:
     data = _load()
     h = data["holdings"].get(stock_code)
     if not h:
         raise ValueError(f"你沒有持有 {stock_code}")
     if shares > h["shares"]:
         raise ValueError(f"賣出股數（{shares}）超過持有（{h['shares']}）")
-
     gross    = shares * price
     fee      = _fee(gross, is_sell=True)
     net      = gross - fee
     avg_cost = h["avg_cost"]
     pnl      = (price - avg_cost) * shares - fee
-
     h["shares"]     -= shares
     h["total_cost"] -= avg_cost * shares
     if h["shares"] == 0:
@@ -155,7 +147,6 @@ def sell(stock_code: str, shares: int, price: float) -> dict:
     else:
         h["avg_cost"] = h["total_cost"] / h["shares"]
         data["holdings"][stock_code] = h
-
     data["cash"]         += net
     data["realized_pnl"] += pnl
     stock_name = h.get("name", stock_code)
@@ -172,13 +163,11 @@ def sell(stock_code: str, shares: int, price: float) -> dict:
 
 
 def get_portfolio_summary(prices: dict) -> dict:
-    data      = _load()
-    cash      = data["cash"]
-    realized  = data["realized_pnl"]
-    holdings  = data["holdings"]
+    data     = _load()
+    cash     = data["cash"]
+    realized = data["realized_pnl"]
     rows, stock_value, unrealized = [], 0.0, 0.0
-
-    for code, h in holdings.items():
+    for code, h in data["holdings"].items():
         price    = prices.get(code)
         shares   = h["shares"]
         avg_cost = h["avg_cost"]
@@ -195,7 +184,6 @@ def get_portfolio_summary(prices: dict) -> dict:
                      "shares": shares, "avg_cost": avg_cost,
                      "price": price_s, "mkt_val": mkt_val,
                      "pnl": pnl, "pnl_pct": pnl_pct})
-
     return {"cash": cash, "stock_value": stock_value,
             "total_assets": cash + stock_value,
             "unrealized": unrealized, "realized": realized,
@@ -204,7 +192,7 @@ def get_portfolio_summary(prices: dict) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 股價取得
+# 股價取得（即時盤中資訊）
 # ══════════════════════════════════════════════════════════════════════
 
 MARKET_OPEN  = dtime(9, 0)
@@ -215,11 +203,10 @@ def is_market_hours() -> bool:
     now = datetime.now(TW_TZ)
     if now.weekday() >= 5:
         return False
-    t = now.time()
-    return MARKET_OPEN <= t <= MARKET_CLOSE
+    return MARKET_OPEN <= now.time() <= MARKET_CLOSE
 
 
-def _twse_price(code: str) -> float | None:
+def _twse_intraday(code: str) -> dict | None:
     try:
         url = (f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
                f"?ex_ch=tse_{code}.tw&json=1&delay=0")
@@ -227,42 +214,320 @@ def _twse_price(code: str) -> float | None:
             "User-Agent": "Mozilla/5.0",
             "Referer": "https://mis.twse.com.tw/stock/index.jsp",
         }, timeout=10)
-        r.raise_for_status()
-        d = r.json()
-        if d.get("rtmessage") == "OK" and d.get("msgArray"):
-            raw = d["msgArray"][0].get("z") or d["msgArray"][0].get("y") or ""
-            if raw and raw != "-":
-                return float(raw)
+        item = r.json()["msgArray"][0]
+        def _f(k):
+            v = item.get(k, "")
+            return float(v) if v and v != "-" else None
+        price = _f("z") or _f("y")
+        prev  = _f("y")
+        high  = _f("h")
+        low   = _f("l")
+        if not price or not prev:
+            return None
+        change_pct   = (price - prev) / prev * 100
+        intraday_pos = ((price - low) / (high - low) * 100
+                        if high and low and high > low else None)
+        return {"price": price, "prev_close": prev, "open": _f("o"),
+                "high": high, "low": low,
+                "change_pct": change_pct, "intraday_pos": intraday_pos}
     except Exception:
-        pass
-    return None
+        return None
 
 
-def _yahoo_price(code: str) -> float | None:
+def _yahoo_intraday(code: str) -> dict | None:
     try:
-        import yfinance as yf
-        hist = yf.Ticker(f"{code}.TW").history(period="1d", interval="5m")
-        if not hist.empty:
-            return float(hist["Close"].iloc[-1])
+        hist = yf.Ticker(f"{code}.TW").history(period="2d", interval="1d")
+        if len(hist) < 2:
+            return None
+        price = float(hist["Close"].iloc[-1])
+        prev  = float(hist["Close"].iloc[-2])
+        return {"price": price, "prev_close": prev, "open": None,
+                "high": float(hist["High"].iloc[-1]),
+                "low":  float(hist["Low"].iloc[-1]),
+                "change_pct": (price - prev) / prev * 100,
+                "intraday_pos": None}
     except Exception:
-        pass
-    return None
+        return None
 
 
-def get_price(code: str) -> float | None:
+def get_intraday(code: str) -> dict | None:
     if is_market_hours():
-        p = _twse_price(code)
-        if p:
-            return p
-    return _yahoo_price(code)
+        d = _twse_intraday(code)
+        if d:
+            return d
+    return _yahoo_intraday(code)
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 股價快取
+# 技術分析
 # ══════════════════════════════════════════════════════════════════════
 
-_cache: dict      = {}
-_cache_lock       = threading.Lock()
+def _fetch_history(code: str, current_price: float | None = None) -> pd.DataFrame | None:
+    try:
+        df = yf.Ticker(f"{code}.TW").history(period="90d", interval="1d")
+        if len(df) < 30:
+            return None
+        if current_price:
+            df.loc[df.index[-1], "Close"] = current_price
+        return df
+    except Exception:
+        return None
+
+
+def _rsi(close: pd.Series, n: int = 14) -> float:
+    delta = close.diff()
+    gain  = delta.clip(lower=0).rolling(n).mean()
+    loss  = (-delta.clip(upper=0)).rolling(n).mean()
+    rs    = gain / loss.replace(0, float("inf"))
+    return float(100 - 100 / (1 + rs.iloc[-1]))
+
+
+def _macd(close: pd.Series):
+    ema12  = close.ewm(span=12, adjust=False).mean()
+    ema26  = close.ewm(span=26, adjust=False).mean()
+    macd   = ema12 - ema26
+    signal = macd.ewm(span=9, adjust=False).mean()
+    hist   = macd - signal
+    return float(macd.iloc[-1]), float(signal.iloc[-1]), float(hist.iloc[-1]), float(hist.iloc[-2])
+
+
+def _kd(high: pd.Series, low: pd.Series, close: pd.Series, n: int = 9):
+    ll  = low.rolling(n).min()
+    hh  = high.rolling(n).max()
+    rsv = (close - ll) / (hh - ll).replace(0, float("nan")) * 100
+    k   = rsv.ewm(com=2, adjust=False).mean()
+    d   = k.ewm(com=2, adjust=False).mean()
+    return float(k.iloc[-1]), float(d.iloc[-1]), float(k.iloc[-2]), float(d.iloc[-2])
+
+
+def _ma_data(close: pd.Series) -> dict:
+    ma5  = close.rolling(5).mean()
+    ma20 = close.rolling(20).mean()
+    ma60 = close.rolling(60).mean()
+    return {
+        "ma5": float(ma5.iloc[-1]), "ma5_prev": float(ma5.iloc[-2]),
+        "ma20": float(ma20.iloc[-1]),
+        "ma60": float(ma60.iloc[-1]) if not pd.isna(ma60.iloc[-1]) else None,
+        "price": float(close.iloc[-1]), "prev_close": float(close.iloc[-2]),
+    }
+
+
+def _vol_ratio(volume: pd.Series) -> float:
+    avg = volume.rolling(20).mean().iloc[-1]
+    return float(volume.iloc[-1] / avg) if avg > 0 else 1.0
+
+
+def _build_result(signals: list, direction: str) -> dict:
+    score     = sum(1 for _, b, _ in signals if b)
+    max_score = len(signals)
+    if direction == "buy":
+        if score >= 4:   level, icon = "強烈建議買進", "🟢🟢"
+        elif score == 3: level, icon = "可考慮買進",  "🟢"
+        elif score == 2: level, icon = "建議觀望",    "🟡"
+        else:            level, icon = "暫不建議買進", "⚪"
+    else:
+        if score >= 4:   level, icon = "強烈建議賣出",    "🔴🔴"
+        elif score == 3: level, icon = "考慮停利/減碼",   "🔴"
+        elif score == 2: level, icon = "留意風險",        "🟠"
+        else:            level, icon = "趨勢尚可，續抱",  "⚪"
+    summary = f"{icon} {level}（{score}/{max_score} 指標{'看多' if direction=='buy' else '看空'}）"
+    return {"signals": signals, "score": score, "max_score": max_score,
+            "level": level, "level_icon": icon, "summary": summary, "direction": direction}
+
+
+def buy_analysis(code: str, price: float, scfg: dict, intraday: dict | None = None) -> dict:
+    df = _fetch_history(code, price)
+    if df is None:
+        return {"error": "無法取得歷史資料"}
+    close, high, low, volume = df["Close"], df["High"], df["Low"], df["Volume"]
+    signals = []
+
+    try:
+        rsi = _rsi(close)
+        bullish = rsi < 35
+        detail  = (f"RSI {rsi:.1f}（{'嚴重超賣 ✦' if rsi<30 else '超賣區' if rsi<35 else '偏弱，未超賣' if rsi<50 else '強勢區，追高風險高'}）")
+        signals.append(("RSI", bullish, detail))
+    except Exception: pass
+
+    try:
+        k, d, k_prev, d_prev = _kd(high, low, close)
+        oversold = k < 30; golden = (k_prev < d_prev) and (k > d)
+        bullish  = oversold or golden
+        detail   = (f"K={k:.1f} D={d:.1f}（{'超賣＋黃金交叉 ✦' if oversold and golden else '超賣區' if oversold else '黃金交叉' if golden else '無超賣訊號'}）")
+        signals.append(("KD", bullish, detail))
+    except Exception: pass
+
+    try:
+        _, _, hist, hist_prev = _macd(close)
+        macd_v, signal_v, _, _ = _macd(close)
+        bottom = (hist < 0) and (hist > hist_prev); above = macd_v > signal_v
+        bullish = bottom or above
+        detail  = ("MACD 多頭＋底部收縮" if bottom and above else
+                   f"MACD 底部收縮（hist={hist:.2f}）" if bottom else
+                   "MACD 在 Signal 上方（多頭）" if above else "MACD 仍在 Signal 下方（空頭）")
+        signals.append(("MACD", bullish, detail))
+    except Exception: pass
+
+    try:
+        ma = _ma_data(close)
+        bullish = ma["ma5"] > ma["ma5_prev"]
+        pos     = "站上MA20" if ma["price"] > ma["ma20"] else "在MA20下方"
+        detail  = f"MA5 {ma['ma5']:,.1f}（{'上彎' if bullish else '下彎'}），{pos}（MA20={ma['ma20']:,.1f}）"
+        signals.append(("均線趨勢", bullish, detail))
+    except Exception: pass
+
+    try:
+        vr = _vol_ratio(volume)
+        bullish = vr >= 1.0
+        detail  = f"今日量 {vr:.1f}x 均量（{'明顯放量' if vr>=1.5 else '量能正常' if vr>=1.0 else '縮量，動能不足'}）"
+        signals.append(("成交量", bullish, detail))
+    except Exception: pass
+
+    try:
+        price_  = float(close.iloc[-1])
+        ma      = _ma_data(close)
+        support = scfg.get("support_price")
+        parts, bullish = [], False
+        if support:
+            diff = (price_ - support) / support * 100
+            if price_ <= support:
+                parts.append(f"現價 {price_:,.0f} 在支撐 {support:,.0f} 以下（{diff:+.1f}%）✦"); bullish = True
+            elif diff <= 3:
+                parts.append(f"現價 {price_:,.0f} 接近支撐 {support:,.0f}（{diff:+.1f}%）"); bullish = True
+            else:
+                parts.append(f"現價 {price_:,.0f} 距支撐 {support:,.0f} 尚有 {diff:.1f}%")
+        if ma["ma60"] and price_ < ma["ma60"]:
+            parts.append(f"跌破MA60({ma['ma60']:,.1f})，長線低估區"); bullish = True
+        elif price_ < ma["ma20"]:
+            parts.append(f"在MA20({ma['ma20']:,.1f})下方")
+            if not support: bullish = True
+        else:
+            parts.append(f"在MA20上方 {(price_-ma['ma20'])/ma['ma20']*100:.1f}%")
+        signals.append(("價格位置", bullish, "、".join(parts)))
+    except Exception: pass
+
+    if intraday:
+        try:
+            cp = intraday.get("change_pct", 0); pos = intraday.get("intraday_pos")
+            if cp <= -3:
+                bullish = True; detail = f"今日重跌 {cp:.1f}%，超賣機會"
+            elif cp <= -1.5 and pos is not None and pos <= 35:
+                bullish = True; detail = f"今日跌 {cp:.1f}%，盤中接近低點（位置 {pos:.0f}%）"
+            elif pos is not None and pos <= 25:
+                bullish = True; detail = f"盤中貼近今日低點（位置 {pos:.0f}%），可能止跌"
+            else:
+                bullish = False
+                detail  = f"今日 {cp:+.1f}%{f'，盤中位置 {pos:.0f}%' if pos is not None else ''}，無明顯超賣"
+            signals.append(("盤中走勢", bullish, detail))
+        except Exception: pass
+
+    return _build_result(signals, "buy")
+
+
+def sell_analysis(code: str, price: float, scfg: dict, intraday: dict | None = None) -> dict:
+    df = _fetch_history(code, price)
+    if df is None:
+        return {"error": "無法取得歷史資料"}
+    close, high, low, volume = df["Close"], df["High"], df["Low"], df["Volume"]
+    signals = []
+
+    try:
+        rsi = _rsi(close)
+        bearish = rsi > 70
+        detail  = (f"RSI {rsi:.1f}（{'嚴重超買 ✦' if rsi>80 else '超買區' if rsi>70 else '偏強，未超買' if rsi>55 else '無超買訊號'}）")
+        signals.append(("RSI", bearish, detail))
+    except Exception: pass
+
+    try:
+        k, d, k_prev, d_prev = _kd(high, low, close)
+        over = k > 80; dead = (k_prev > d_prev) and (k < d)
+        bearish = over or dead
+        detail  = (f"K={k:.1f} D={d:.1f}（{'超買＋死亡交叉 ✦' if over and dead else '超買區' if over else '死亡交叉' if dead else '無超買訊號'}）")
+        signals.append(("KD", bearish, detail))
+    except Exception: pass
+
+    try:
+        macd_v, signal_v, hist, hist_prev = _macd(close)
+        top = (hist > 0) and (hist < hist_prev); below = macd_v < signal_v
+        bearish = top or below
+        detail  = ("MACD 空頭＋頂部收縮" if top and below else
+                   f"MACD 頂部收縮（hist={hist:.2f}）" if top else
+                   "MACD 跌破 Signal（空頭）" if below else "MACD 仍在 Signal 上方（多頭）")
+        signals.append(("MACD", bearish, detail))
+    except Exception: pass
+
+    try:
+        ma = _ma_data(close)
+        bearish = ma["ma5"] < ma["ma5_prev"]
+        parts   = []
+        if ma["price"] < ma["ma20"]: parts.append(f"跌破MA20({ma['ma20']:,.1f})")
+        if ma["ma60"] and ma["price"] < ma["ma60"]: parts.append(f"跌破MA60({ma['ma60']:,.1f})⚠")
+        detail  = f"MA5 {ma['ma5']:,.1f}（{'下彎' if bearish else '上彎'}），{'、'.join(parts) if parts else '仍在MA20上方'}"
+        signals.append(("均線趨勢", bearish, detail))
+    except Exception: pass
+
+    try:
+        vr = _vol_ratio(volume); ma = _ma_data(close)
+        drop = ma["price"] < ma["prev_close"]
+        bearish = (vr >= 1.2) and drop
+        detail  = (f"今日量 {vr:.1f}x 均量且下跌（疑似出貨）" if bearish else
+                   f"今日量 {vr:.1f}x 均量但收漲（多頭放量）" if vr >= 1.5 else
+                   f"今日量 {vr:.1f}x 均量（無異常）")
+        signals.append(("成交量", bearish, detail))
+    except Exception: pass
+
+    try:
+        price_     = float(close.iloc[-1])
+        ma         = _ma_data(close)
+        resistance = scfg.get("resistance_price")
+        parts, bearish = [], False
+        if resistance:
+            diff = (price_ - resistance) / resistance * 100
+            if price_ >= resistance:
+                parts.append(f"現價 {price_:,.0f} 已達壓力 {resistance:,.0f}（{diff:+.1f}%）✦"); bearish = True
+            elif diff >= -3:
+                parts.append(f"現價 {price_:,.0f} 接近壓力 {resistance:,.0f}（{diff:+.1f}%）"); bearish = True
+            else:
+                parts.append(f"現價 {price_:,.0f} 距壓力 {resistance:,.0f} 尚有 {-diff:.1f}%")
+        pct_above = (price_ - ma["ma20"]) / ma["ma20"] * 100
+        if pct_above >= 10:
+            parts.append(f"高於MA20 {pct_above:.1f}%（偏離過大）"); bearish = bearish or (not resistance)
+        else:
+            parts.append(f"在MA20{'上方' if pct_above>=0 else '下方'} {abs(pct_above):.1f}%")
+        signals.append(("價格位置", bearish, "、".join(parts)))
+    except Exception: pass
+
+    if intraday:
+        try:
+            cp = intraday.get("change_pct", 0); pos = intraday.get("intraday_pos")
+            if cp >= 3:
+                bearish = True; detail = f"今日大漲 {cp:.1f}%，超買風險高"
+            elif cp >= 1.5 and pos is not None and pos >= 65:
+                bearish = True; detail = f"今日漲 {cp:.1f}%，盤中貼近高點（位置 {pos:.0f}%）"
+            elif pos is not None and pos >= 75:
+                bearish = True; detail = f"盤中在今日高點附近（位置 {pos:.0f}%），動能可能衰退"
+            else:
+                bearish = False
+                detail  = f"今日 {cp:+.1f}%{f'，盤中位置 {pos:.0f}%' if pos is not None else ''}，無明顯超買"
+            signals.append(("盤中走勢", bearish, detail))
+        except Exception: pass
+
+    return _build_result(signals, "sell")
+
+
+def decision_line(result: dict) -> str:
+    if "error" in result:
+        return f"⚠ {result['error']}\n"
+    active = [name for name, b, _ in result["signals"] if b]
+    return f"根據：{' + '.join(active[:3]) if active else '無明顯訊號'}\n"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 股價快取（Web API 用）
+# ══════════════════════════════════════════════════════════════════════
+
+_cache: dict       = {}
+_cache_lock        = threading.Lock()
 _last_fetch: float = 0.0
 
 
@@ -273,9 +538,9 @@ def get_prices() -> dict:
         cfg   = load_config()
         fresh = {}
         for code in cfg.get("stocks", {}):
-            p = get_price(code)
-            if p:
-                fresh[code] = p
+            d = get_intraday(code)
+            if d:
+                fresh[code] = d["price"]
         with _cache_lock:
             if fresh:
                 _cache = fresh
@@ -285,22 +550,11 @@ def get_prices() -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 監控 & LINE 通知
+# 通知
 # ══════════════════════════════════════════════════════════════════════
 
 _notified: dict[str, float] = {}
 NOTIFY_COOLDOWN_SEC = 1800
-
-CONDITION_META = {
-    "buy_below":  ("🟢", "【買進訊號】", "跌至 {target} 以下，現價 {price:.0f} 元"),
-    "sell_above": ("🔴", "【停利訊號】", "漲至 {target} 以上，現價 {price:.0f} 元"),
-    "stop_loss":  ("🚨", "【停損警報】", "跌破 {target}，現價 {price:.0f} 元  立刻賣出！"),
-}
-
-
-def load_config() -> dict:
-    with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-        return json.load(f)
 
 
 def send_ntfy(title: str, message: str, priority: str = "default") -> bool:
@@ -320,45 +574,94 @@ def send_ntfy(title: str, message: str, priority: str = "default") -> bool:
         return False
 
 
-def notify(token: str, alert_key: str, message: str, title: str = "📈 台股監控",
-           priority: str = "default", cooldown: int = NOTIFY_COOLDOWN_SEC):
+def notify(alert_key: str, message: str, title: str = "股市通知", priority: str = "default"):
     now_ts = time.time()
-    if now_ts - _notified.get(alert_key, 0) < cooldown:
+    if now_ts - _notified.get(alert_key, 0) < NOTIFY_COOLDOWN_SEC:
         return
     _notified[alert_key] = now_ts
     log.info(f"  ➜ 推播：{message[:60]}…")
     send_ntfy(title, message, priority)
 
 
-def check_stock(code: str, scfg: dict, token: str, price: float):
-    name  = scfg.get("name", code)
-    now_s = datetime.now(TW_TZ).strftime("%Y/%m/%d %H:%M")
+# ══════════════════════════════════════════════════════════════════════
+# 監控主邏輯
+# ══════════════════════════════════════════════════════════════════════
 
-    for cond in scfg.get("conditions", []):
-        ctype, target = cond["type"], cond["price"]
-        triggered = (
-            (ctype == "buy_below"  and price <= target) or
-            (ctype == "sell_above" and price >= target) or
-            (ctype == "stop_loss"  and price <= target)
-        )
-        if not triggered:
-            continue
-        icon, title, desc_tpl = CONDITION_META.get(ctype, ("⚡", f"[{ctype}]", "{price:.0f}"))
-        desc = desc_tpl.format(price=price, target=target)
-        holding = _load()["holdings"].get(code, {})
-        holding_note = ""
-        if holding:
-            holding_note = (f"\n── 你的持倉 ──\n"
-                            f"持有 {holding['shares']} 股  均價 {holding['avg_cost']:,.0f} 元")
-        body = (f"{desc}\n{cond.get('label','')}{holding_note}\n⏰ {now_s}")
-        if ctype == "stop_loss":
-            notify(token, f"{code}_{ctype}_{target}", body,
-                   title=f"{icon} {name}（{code}）{title}",
-                   priority="urgent", cooldown=300)   # 每 5 分鐘一直推
+def _price_line(intraday: dict) -> str:
+    price = intraday["price"]
+    cp    = intraday["change_pct"]
+    sign  = "↑" if cp >= 0 else "↓"
+    pos   = intraday.get("intraday_pos")
+    pos_s = f"  盤中位置 {pos:.0f}%" if pos is not None else ""
+    h, l  = intraday.get("high"), intraday.get("low")
+    hl_s  = f"  今日 {l:,.0f}～{h:,.0f}" if h and l else ""
+    return f"現價 {price:,.0f}｜今日 {sign}{abs(cp):.1f}%{pos_s}{hl_s}"
+
+
+def _suggest_shares(code: str, scfg: dict, price: float) -> str:
+    budget = scfg.get("budget")
+    if not budget or price <= 0:
+        return ""
+    invested  = _load()["holdings"].get(code, {}).get("total_cost", 0.0)
+    remaining = budget - invested
+    if remaining <= 0:
+        return f"\n💰 預算已用完（已投入 {invested:,.0f} / {budget:,.0f} 元）"
+    shares = int(remaining // price)
+    if shares <= 0:
+        return f"\n💰 剩餘預算不足買入 1 股（剩 {remaining:,.0f} 元）"
+    return (f"\n📌 建議買入：{shares} 股零股（現價 {price:,.0f} 元，約需 {shares*price:,.0f} 元）"
+            f"\n   剩餘預算 {remaining:,.0f} 元（預算 {budget:,.0f}，已投入 {invested:,.0f}）")
+
+
+def _holding_note(code: str, price: float) -> str:
+    h = _load()["holdings"].get(code, {})
+    if not h:
+        return ""
+    pnl  = (price - h["avg_cost"]) * h["shares"]
+    sign = "▲" if pnl >= 0 else "▼"
+    return (f"\n── 持倉 ──\n"
+            f"持有 {h['shares']} 股  均價 {h['avg_cost']:,.0f} 元\n"
+            f"未實現損益：{sign}{abs(pnl):,.0f} 元")
+
+
+def check_stock(code: str, scfg: dict, intraday: dict, cfg: dict):
+    price    = intraday["price"]
+    name     = scfg.get("name", code)
+    now_s    = datetime.now(TW_TZ).strftime("%Y/%m/%d %H:%M")
+    buy_thr  = cfg.get("buy_threshold", 3)
+    sell_thr = cfg.get("sell_threshold", 3)
+
+    log.info(f"  分析技術指標（{name} {code}）…")
+    buy_r  = buy_analysis(code, price, scfg, intraday)
+    sell_r = sell_analysis(code, price, scfg, intraday)
+
+    holding      = _load()["holdings"].get(code, {})
+    has_position = bool(holding)
+
+    if "error" not in buy_r and buy_r["score"] >= buy_thr:
+        msg = (f"🟢 {name}（{code}）{buy_r['level']}\n"
+               f"{_price_line(intraday)}\n"
+               f"{decision_line(buy_r)}"
+               f"{_suggest_shares(code, scfg, price)}"
+               f"{_holding_note(code, price)}\n"
+               f"⏰ {now_s}")
+        notify(f"{code}_buy", msg, f"買進訊號｜{name}", "high")
+
+    if has_position and "error" not in sell_r and sell_r["score"] >= sell_thr:
+        avg_cost = holding["avg_cost"]
+        pnl_pct  = (price - avg_cost) / avg_cost * 100
+        if pnl_pct <= -5:
+            icon, action = "🚨", "建議停損出場"
+        elif pnl_pct >= 5:
+            icon, action = "🔴", "建議停利出場"
         else:
-            notify(token, f"{code}_{ctype}_{target}", body,
-                   title=f"{icon} {name}（{code}）{title}",
-                   priority="high", cooldown=NOTIFY_COOLDOWN_SEC)
+            icon, action = "🟠", "建議減碼觀察"
+        msg = (f"{icon} {name}（{code}）{action}\n"
+               f"{_price_line(intraday)}\n"
+               f"{decision_line(sell_r)}"
+               f"{_holding_note(code, price)}\n"
+               f"⏰ {now_s}")
+        notify(f"{code}_sell", msg, f"賣出訊號｜{name}", "urgent" if pnl_pct <= -5 else "high")
 
 
 def run_check():
@@ -371,36 +674,37 @@ def run_check():
     log.info(f"[{now_s}] 開始檢查股價")
     prices = {}
     for code, scfg in cfg.get("stocks", {}).items():
-        p = get_price(code)
-        if p is None:
-            log.warning(f"  {scfg.get('name',code)} ({code})：無法取得股價")
+        intraday = get_intraday(code)
+        if not intraday:
+            log.warning(f"  {scfg.get('name', code)} ({code})：無法取得股價")
             continue
-        prices[code] = p
-        log.info(f"  {scfg.get('name',code)} ({code})：{p:,.0f} 元")
-        check_stock(code, scfg, "", p)
-    summary = get_portfolio_summary(prices)
+        price = intraday["price"]
+        prices[code] = price
+        cp   = intraday["change_pct"]
+        sign = "↑" if cp >= 0 else "↓"
+        log.info(f"  {scfg.get('name',code)} ({code})：{price:,.0f} 元（{sign}{abs(cp):.1f}%）")
+        check_stock(code, scfg, intraday, cfg)
     now = datetime.now(TW_TZ)
     if now.minute < 6:
-        lines = ["\n📊 即時持倉摘要"]
+        summary = get_portfolio_summary(prices)
+        lines   = ["\n📊 即時持倉摘要"]
         for r in summary["rows"]:
             lines.append(f"  {r['name']}({r['code']}) {r['shares']}股"
                          f" | 均{r['avg_cost']:,.0f} 現{r['price']}"
                          f" | {'▲' if r['pnl']>=0 else '▼'}{abs(r['pnl']):,.0f}元({r['pnl_pct']:+.1f}%)")
-        lines.append(f"  現金：{summary['cash']:,.0f} 元")
-        lines.append(f"  總資產：{summary['total_assets']:,.0f} 元")
-        notify("", f"portfolio_hourly_{now.hour}", "\n".join(lines),
-               title="📊 每小時持倉摘要")
+        lines.append(f"  現金：{summary['cash']:,.0f}  總資產：{summary['total_assets']:,.0f}")
+        notify(f"portfolio_hourly_{now.hour}", "\n".join(lines), "持倉摘要")
 
 
 def _monitor_thread():
     cfg      = load_config()
-    interval = cfg.get("check_interval_minutes", 5)
+    interval = cfg.get("check_interval_minutes", 1)
     run_check()
     schedule.every(interval).minutes.do(run_check)
     log.info(f"監控執行緒啟動（每 {interval} 分鐘）")
     while True:
         schedule.run_pending()
-        time.sleep(30)
+        time.sleep(5)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -412,11 +716,13 @@ app = Flask(__name__)
 
 @app.route("/api/portfolio")
 def api_portfolio():
-    prices  = get_prices()
-    summary = get_portfolio_summary(prices)
-    cfg     = load_config()
+    prices     = get_prices()
+    summary    = get_portfolio_summary(prices)
+    cfg        = load_config()
     stocks_cfg = {
-        code: {"name": s.get("name", code), "conditions": s.get("conditions", [])}
+        code: {"name": s.get("name", code),
+               "support_price": s.get("support_price"),
+               "resistance_price": s.get("resistance_price")}
         for code, s in cfg.get("stocks", {}).items()
     }
     return jsonify({"summary": summary, "prices": prices,
@@ -427,8 +733,8 @@ def api_portfolio():
 def api_buy():
     d = request.json or {}
     try:
-        result = buy(d["code"], d.get("name", d["code"]),
-                     int(d["shares"]), float(d["price"]))
+        result = pf_buy(d["code"], d.get("name", d["code"]),
+                        int(d["shares"]), float(d["price"]))
         return jsonify({"ok": True, "result": result})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 400
@@ -438,7 +744,7 @@ def api_buy():
 def api_sell():
     d = request.json or {}
     try:
-        result = sell(d["code"], int(d["shares"]), float(d["price"]))
+        result = pf_sell(d["code"], int(d["shares"]), float(d["price"]))
         return jsonify({"ok": True, "result": result})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 400
@@ -453,8 +759,7 @@ def api_cash():
 
 @app.route("/api/history")
 def api_history():
-    data = _load()
-    return jsonify(list(reversed(data.get("transactions", []))))
+    return jsonify(list(reversed(_load().get("transactions", []))))
 
 
 @app.route("/api/config", methods=["GET"])
@@ -485,7 +790,6 @@ def manifest():
 # ══════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    t = threading.Thread(target=_monitor_thread, daemon=True)
-    t.start()
-    log.info(f"台股監控雲端版啟動中，PORT={PORT}")
+    threading.Thread(target=_monitor_thread, daemon=True).start()
+    log.info(f"台股監控雲端版啟動，PORT={PORT}")
     app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)

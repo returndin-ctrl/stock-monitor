@@ -647,7 +647,7 @@ def check_stock(code: str, scfg: dict, intraday: dict, cfg: dict):
                f"⏰ {now_s}")
         notify(f"{code}_buy", msg, f"買進訊號｜{name}", "high")
 
-    if has_position and "error" not in sell_r and sell_r["score"] >= sell_thr:
+    if has_position and not scfg.get("no_sell_alert") and "error" not in sell_r and sell_r["score"] >= sell_thr:
         avg_cost = holding["avg_cost"]
         pnl_pct  = (price - avg_cost) / avg_cost * 100
         if pnl_pct <= -5:

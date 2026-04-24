@@ -556,10 +556,20 @@ def get_prices() -> dict:
 _notified: dict[str, float] = {}
 NOTIFY_COOLDOWN_SEC = 1800
 
+# 監控執行緒狀態追蹤
+_monitor_status = {
+    "running": False,
+    "last_check": None,
+    "last_error": None,
+    "checks_today": 0,
+    "notifications_sent": 0,
+}
+
 
 def send_ntfy(title: str, message: str, priority: str = "default") -> bool:
     topic = NTFY_TOPIC or load_config().get("ntfy_topic", "")
     if not topic:
+        log.warning("ntfy topic 未設定，跳過推播")
         return False
     try:
         r = requests.post(
@@ -568,7 +578,12 @@ def send_ntfy(title: str, message: str, priority: str = "default") -> bool:
             headers={"Title": title, "Priority": priority, "Tags": "chart_increasing"},
             timeout=10,
         )
-        return r.status_code == 200
+        ok = r.status_code == 200
+        if ok:
+            _monitor_status["notifications_sent"] += 1
+        else:
+            log.warning(f"ntfy 回應異常：{r.status_code}")
+        return ok
     except Exception as e:
         log.error(f"ntfy 通知失敗：{e}")
         return False
@@ -667,11 +682,13 @@ def check_stock(code: str, scfg: dict, intraday: dict, cfg: dict):
 def run_check():
     cfg   = load_config()
     now_s = datetime.now(TW_TZ).strftime("%H:%M")
+    _monitor_status["last_check"] = datetime.now(TW_TZ).strftime("%Y/%m/%d %H:%M:%S")
     if not is_market_hours():
         log.info(f"[{now_s}] 非交易時段，等待中…")
         return
     log.info(f"{'─'*40}")
     log.info(f"[{now_s}] 開始檢查股價")
+    _monitor_status["checks_today"] += 1
     prices = {}
     for code, scfg in cfg.get("stocks", {}).items():
         intraday = get_intraday(code)
@@ -697,14 +714,29 @@ def run_check():
 
 
 def _monitor_thread():
-    cfg      = load_config()
-    interval = cfg.get("check_interval_minutes", 1)
-    run_check()
-    schedule.every(interval).minutes.do(run_check)
-    log.info(f"監控執行緒啟動（每 {interval} 分鐘）")
-    while True:
-        schedule.run_pending()
-        time.sleep(5)
+    _monitor_status["running"] = True
+    try:
+        cfg      = load_config()
+        interval = cfg.get("check_interval_minutes", 1)
+        topic    = NTFY_TOPIC or cfg.get("ntfy_topic", "")
+        log.info(f"監控執行緒啟動（每 {interval} 分鐘，ntfy={'已設定 '+topic if topic else '未設定⚠'}）")
+        # 啟動確認通知
+        if topic:
+            send_ntfy("股市監控啟動", f"監控執行緒已啟動，每 {interval} 分鐘檢查一次\n"
+                      f"監控股票：{', '.join(cfg.get('stocks', {}).keys())}", "low")
+        run_check()
+        schedule.every(interval).minutes.do(run_check)
+        while True:
+            try:
+                schedule.run_pending()
+            except Exception as e:
+                log.error(f"排程執行錯誤：{e}")
+                _monitor_status["last_error"] = str(e)
+            time.sleep(5)
+    except Exception as e:
+        _monitor_status["running"] = False
+        _monitor_status["last_error"] = str(e)
+        log.error(f"監控執行緒崩潰：{e}")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -760,6 +792,20 @@ def api_cash():
 @app.route("/api/history")
 def api_history():
     return jsonify(list(reversed(_load().get("transactions", []))))
+
+
+@app.route("/api/status")
+def api_status():
+    cfg   = load_config()
+    topic = NTFY_TOPIC or cfg.get("ntfy_topic", "")
+    return jsonify({
+        "monitor": _monitor_status,
+        "ntfy_topic": topic if topic else "(未設定)",
+        "ntfy_topic_source": "env" if NTFY_TOPIC else ("config" if cfg.get("ntfy_topic") else "none"),
+        "market_open": is_market_hours(),
+        "now_tw": datetime.now(TW_TZ).strftime("%Y/%m/%d %H:%M:%S"),
+        "stocks": list(cfg.get("stocks", {}).keys()),
+    })
 
 
 @app.route("/api/config", methods=["GET"])

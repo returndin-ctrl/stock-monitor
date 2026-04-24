@@ -262,16 +262,35 @@ def get_intraday(code: str) -> dict | None:
 # 技術分析
 # ══════════════════════════════════════════════════════════════════════
 
+# 歷史資料快取（每小時更新一次，避免 yfinance 限流）
+_hist_cache: dict[str, tuple[float, pd.DataFrame]] = {}  # code -> (timestamp, df)
+HIST_CACHE_TTL = 3600  # 1 小時
+
+
 def _fetch_history(code: str, current_price: float | None = None) -> pd.DataFrame | None:
-    try:
-        df = yf.Ticker(f"{code}.TW").history(period="90d", interval="1d")
-        if len(df) < 30:
-            return None
-        if current_price:
-            df.loc[df.index[-1], "Close"] = current_price
-        return df
-    except Exception:
-        return None
+    now = time.time()
+    cached_ts, cached_df = _hist_cache.get(code, (0, None))
+    if cached_df is not None and now - cached_ts < HIST_CACHE_TTL:
+        df = cached_df.copy()
+    else:
+        try:
+            df = yf.Ticker(f"{code}.TW").history(period="90d", interval="1d")
+            if len(df) < 30:
+                log.warning(f"  {code} 歷史資料不足（{len(df)} 筆）")
+                return None
+            _hist_cache[code] = (now, df.copy())
+            log.info(f"  {code} 歷史資料更新（{len(df)} 筆）")
+        except Exception as e:
+            log.error(f"  {code} 歷史資料下載失敗：{e}")
+            if cached_df is not None:
+                log.info(f"  {code} 使用舊快取（{int((now-cached_ts)/60)} 分鐘前）")
+                df = cached_df.copy()
+            else:
+                return None
+    if current_price:
+        df = df.copy()
+        df.loc[df.index[-1], "Close"] = current_price
+    return df
 
 
 def _rsi(close: pd.Series, n: int = 14) -> float:
@@ -792,6 +811,45 @@ def api_cash():
 @app.route("/api/history")
 def api_history():
     return jsonify(list(reversed(_load().get("transactions", []))))
+
+
+@app.route("/api/debug_check")
+def api_debug_check():
+    """手動觸發一次檢查，回傳每支股票的分析結果"""
+    cfg    = load_config()
+    result = {}
+    for code, scfg in cfg.get("stocks", {}).items():
+        intraday = get_intraday(code)
+        if not intraday:
+            result[code] = {"error": "無法取得股價"}
+            continue
+        price = intraday["price"]
+        buy_r  = buy_analysis(code, price, scfg, intraday)
+        sell_r = sell_analysis(code, price, scfg, intraday)
+        buy_thr  = cfg.get("buy_threshold", 3)
+        sell_thr = cfg.get("sell_threshold", 3)
+        has_pos  = bool(_load()["holdings"].get(code))
+        result[code] = {
+            "name":       scfg.get("name", code),
+            "price":      price,
+            "change_pct": round(intraday.get("change_pct", 0), 2),
+            "buy_score":  buy_r.get("score"),
+            "sell_score": sell_r.get("score"),
+            "buy_triggered":  (buy_r.get("score", 0) >= buy_thr) if "error" not in buy_r else False,
+            "sell_triggered": (has_pos and not scfg.get("no_sell_alert") and
+                               sell_r.get("score", 0) >= sell_thr) if "error" not in sell_r else False,
+            "buy_error":  buy_r.get("error"),
+            "sell_error": sell_r.get("error"),
+            "hist_cached": code in _hist_cache,
+        }
+    topic = NTFY_TOPIC or cfg.get("ntfy_topic", "")
+    return jsonify({
+        "time_tw": datetime.now(TW_TZ).strftime("%Y/%m/%d %H:%M:%S"),
+        "market_open": is_market_hours(),
+        "ntfy_topic": topic or "(未設定)",
+        "buy_threshold": cfg.get("buy_threshold", 3),
+        "stocks": result,
+    })
 
 
 @app.route("/api/status")

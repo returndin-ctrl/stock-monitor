@@ -23,8 +23,8 @@ CONFIG_FILE    = os.path.join(DATA_DIR, 'config.json')
 DEFAULT_CONFIG = {
     "ntfy_topic": "",
     "check_interval_minutes": 1,
-    "buy_threshold": 3,
-    "sell_threshold": 3,
+    "buy_threshold": 4,
+    "sell_threshold": 5,
     "stocks": {
         "2330": {
             "name": "台積電",
@@ -573,7 +573,7 @@ def get_prices() -> dict:
 # ══════════════════════════════════════════════════════════════════════
 
 _notified: dict[str, float] = {}
-NOTIFY_COOLDOWN_SEC = 1800
+NOTIFY_COOLDOWN_SEC = 3600
 
 # 監控執行緒狀態追蹤
 _monitor_status = {
@@ -662,8 +662,8 @@ def check_stock(code: str, scfg: dict, intraday: dict, cfg: dict):
     price    = intraday["price"]
     name     = scfg.get("name", code)
     now_s    = datetime.now(TW_TZ).strftime("%Y/%m/%d %H:%M")
-    buy_thr  = cfg.get("buy_threshold", 3)
-    sell_thr = cfg.get("sell_threshold", 3)
+    buy_thr  = cfg.get("buy_threshold", 4)
+    sell_thr = cfg.get("sell_threshold", 5)
 
     log.info(f"  分析技術指標（{name} {code}）…")
     buy_r  = buy_analysis(code, price, scfg, intraday)
@@ -672,7 +672,11 @@ def check_stock(code: str, scfg: dict, intraday: dict, cfg: dict):
     holding      = _load()["holdings"].get(code, {})
     has_position = bool(holding)
 
-    if "error" not in buy_r and buy_r["score"] >= buy_thr:
+    b_score = buy_r.get("score", 0) if "error" not in buy_r else 0
+    s_score = sell_r.get("score", 0) if "error" not in sell_r else 0
+
+    # 買訊：達門檻，且買分 > 賣分（避免訊號衝突）
+    if "error" not in buy_r and b_score >= buy_thr and b_score > s_score:
         msg = (f"🟢 {name}（{code}）{buy_r['level']}\n"
                f"{_price_line(intraday)}\n"
                f"{decision_line(buy_r)}"
@@ -681,7 +685,7 @@ def check_stock(code: str, scfg: dict, intraday: dict, cfg: dict):
                f"⏰ {now_s}")
         notify(f"{code}_buy", msg, f"買進訊號｜{name}", "high")
 
-    if has_position and not scfg.get("no_sell_alert") and "error" not in sell_r and sell_r["score"] >= sell_thr:
+    if has_position and not scfg.get("no_sell_alert") and "error" not in sell_r and s_score >= sell_thr and s_score > b_score:
         avg_cost = holding["avg_cost"]
         pnl_pct  = (price - avg_cost) / avg_cost * 100
         if pnl_pct <= -5:

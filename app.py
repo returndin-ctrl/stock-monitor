@@ -884,6 +884,83 @@ def get_overnight_us() -> dict:
     return result
 
 
+# ══════════════════════════════════════════════════════════════════════
+# 法說會行事曆（抓 cmoney 個股行事曆頁）
+# ══════════════════════════════════════════════════════════════════════
+
+_event_cache: dict[str, dict] = {}
+_EVENT_TTL = 86400  # 法說會日期 1 天抓一次
+
+
+def fetch_earnings_call(code: str) -> dict | None:
+    """抓 cmoney 該股最近一次法說會。回傳 {date, topic} 或 None"""
+    import re
+    try:
+        r = requests.get(
+            f"https://www.cmoney.tw/forum/stock/{code}?s=calendar",
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=10,
+        )
+        if not r.ok:
+            return None
+        m = re.search(r'allTableData:(\[\[.*?\]\])', r.text)
+        if not m:
+            return None
+        block = m.group(1)
+        d = re.search(r'"開會日期","([^"]+)"', block)
+        t = re.search(r'"法說會 擇要訊息","([^"]+)"', block)
+        if not d:
+            return None
+        topic = (t.group(1) if t else "").replace("\\u002F", "/")
+        # 主題太長截斷
+        if len(topic) > 50:
+            topic = topic[:50] + "…"
+        return {"date": d.group(1), "topic": topic}
+    except Exception as e:
+        log.debug(f"法說會抓取失敗 ({code}): {e}")
+        return None
+
+
+def get_event_window(code: str) -> dict | None:
+    """回傳法說會視窗狀態：None 或 {date, topic, days_until, phase}
+    phase: pre（前 1-7 天）/ today / post（後 1-5 天）"""
+    now = time.time()
+    cached = _event_cache.get(code)
+    if cached and now - cached["ts"] < _EVENT_TTL:
+        info = cached["info"]
+    else:
+        info = fetch_earnings_call(code)
+        _event_cache[code] = {"info": info, "ts": now}
+    if not info:
+        return None
+    try:
+        from datetime import date as _date
+        y, m, d = info["date"].split("-")
+        ev_date = _date(int(y), int(m), int(d))
+        today = datetime.now(TW_TZ).date()
+        days_until = (ev_date - today).days
+        if -5 <= days_until <= 7:
+            if days_until > 0:
+                phase = "pre"
+            elif days_until == 0:
+                phase = "today"
+            else:
+                phase = "post"
+            return {**info, "days_until": days_until, "phase": phase}
+    except Exception:
+        pass
+    return None
+
+
+def event_summary_line(ev: dict | None) -> str:
+    if not ev:
+        return ""
+    if ev["phase"] == "pre":
+        return f"📅 距 {ev['date']} 法說會 {ev['days_until']} 天（慎追利多）"
+    if ev["phase"] == "today":
+        return f"📅 今天 {ev['date']} 法說會"
+    return f"📅 法說會已過 {-ev['days_until']} 天（{ev['date']}），留意利多兌現賣壓"
+
+
 def overnight_summary_line(ov: dict) -> str:
     if not ov["rows"]:
         return ""
@@ -912,18 +989,22 @@ def check_stock(code: str, scfg: dict, intraday: dict, cfg: dict):
     buy_r  = buy_analysis(code, price, scfg, intraday)
     sell_r = sell_analysis(code, price, scfg, intraday)
 
-    # 族群連動 + 新聞 + 大盤 + 美股隔夜（皆有 cache）
+    # 族群 + 新聞 + 大盤 + 美股隔夜 + 法說會視窗（皆有 cache）
     pulse     = get_peer_pulse()
     news      = scan_news(code, name)
     market    = get_market_pulse()
     overnight = get_overnight_us()
+    event     = get_event_window(code)
+    # 法說會視窗：pre/today/post 都列為 risk（避免追利多 + 警示兌現賣壓）
+    in_event  = event is not None
     risk      = (pulse["alarm_down"] or bool(news["bad_hits"]) or
-                 market["alarm"] or overnight["big_drop"])
+                 market["alarm"] or overnight["big_drop"] or in_event)
     boost     = pulse["alarm_up"] or market["boost"] or overnight["big_rally"]
     peer_ln   = peer_summary_line(pulse)
     mkt_ln    = market_summary_line(market)
     ov_ln     = overnight_summary_line(overnight)
-    context   = "\n".join(x for x in (mkt_ln, peer_ln, ov_ln) if x)
+    ev_ln     = event_summary_line(event)
+    context   = "\n".join(x for x in (mkt_ln, peer_ln, ov_ln, ev_ln) if x)
     if context:
         context += "\n"
 
@@ -991,6 +1072,10 @@ def run_check():
     if (mkt := market_summary_line(market)):       log.info(f"  {mkt}")
     if (ov  := overnight_summary_line(overnight)): log.info(f"  {ov}")
     if pulse["rows"]:                              log.info(f"  {peer_summary_line(pulse)}")
+    for code, scfg in cfg.get("stocks", {}).items():
+        ev = get_event_window(code)
+        if ev:
+            log.info(f"  {scfg.get('name', code)} {event_summary_line(ev)}")
     prices = {}
     for code, scfg in cfg.get("stocks", {}).items():
         intraday = get_intraday(code)

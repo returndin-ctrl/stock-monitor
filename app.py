@@ -7,7 +7,7 @@
 import sys, os, time, json, threading, logging, requests, schedule, pytz
 import pandas as pd
 import yfinance as yf
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta
 from flask import Flask, jsonify, request, render_template
 
 # ── 環境變數 ──────────────────────────────────────────────────────────
@@ -951,6 +951,139 @@ def get_event_window(code: str) -> dict | None:
     return None
 
 
+# ══════════════════════════════════════════════════════════════════════
+# 三大法人籌碼（證交所 T86）
+# ══════════════════════════════════════════════════════════════════════
+
+_T86_FILE   = os.path.join(DATA_DIR, 't86_history.json')
+_t86_cache  = {"data": None, "ts": 0.0}
+_T86_TTL    = 21600  # 6 小時抓一次（盤後資料盤後公布）
+
+
+def _parse_int(s) -> int:
+    try:
+        return int(str(s).replace(',', '').strip())
+    except Exception:
+        return 0
+
+
+def _t86_load() -> dict:
+    if not os.path.exists(_T86_FILE):
+        return {}
+    try:
+        with open(_T86_FILE, encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _t86_save(data: dict):
+    keys = sorted(data.keys())[-10:]  # 只保留最近 10 個交易日
+    with open(_T86_FILE, 'w', encoding='utf-8') as f:
+        json.dump({k: data[k] for k in keys}, f, ensure_ascii=False)
+
+
+def fetch_twse_t86(date_str: str) -> dict | None:
+    """抓某日三大法人買賣超。date_str: YYYYMMDD"""
+    try:
+        r = requests.get(
+            f"https://www.twse.com.tw/rwd/zh/fund/T86?date={date_str}&selectType=ALL&response=json",
+            timeout=15,
+        )
+        if not r.ok:
+            return None
+        d = r.json()
+        if d.get("stat") != "OK":
+            return None
+        result = {}
+        for row in d.get("data", []):
+            if len(row) < 19:
+                continue
+            code = row[0].strip()
+            result[code] = {
+                "fii":    _parse_int(row[4]),    # 外陸資買賣超
+                "trust":  _parse_int(row[10]),   # 投信
+                "dealer": _parse_int(row[11]),   # 自營商
+                "total":  _parse_int(row[18]),   # 三大法人合計
+            }
+        return result
+    except Exception as e:
+        log.debug(f"T86 抓取失敗 ({date_str}): {e}")
+        return None
+
+
+def update_t86() -> dict:
+    """抓最近 5 個交易日的 T86 並更新 history（缺漏才抓）"""
+    now = time.time()
+    if _t86_cache["data"] and now - _t86_cache["ts"] < _T86_TTL:
+        return _t86_cache["data"]
+    history = _t86_load()
+    today = datetime.now(TW_TZ).date()
+    found = 0
+    for n in range(10):  # 倒回最多 10 天找 5 個交易日
+        d = today - timedelta(days=n)
+        if d.weekday() >= 5:
+            continue
+        date_str = d.strftime("%Y%m%d")
+        if date_str not in history:
+            data = fetch_twse_t86(date_str)
+            if data:
+                history[date_str] = data
+        if date_str in history:
+            found += 1
+        if found >= 5:
+            break
+    _t86_save(history)
+    _t86_cache["data"] = history
+    _t86_cache["ts"]   = now
+    return history
+
+
+def get_inst_pulse(code: str) -> dict | None:
+    """個股三大法人動向：連續日數、警示旗標"""
+    history = update_t86()
+    dates = sorted(history.keys())[-5:]
+    rows = []
+    for d in dates:
+        rec = history[d].get(code)
+        if rec:
+            rows.append({"date": d, **rec})
+    if len(rows) < 3:
+        return None
+    # 連續日數（從最新往前數，看 fii 是否連續同方向）
+    fii_sell = fii_buy = 0
+    for r in reversed(rows):
+        if r["fii"] < 0:
+            if fii_buy == 0: fii_sell += 1
+            else: break
+        elif r["fii"] > 0:
+            if fii_sell == 0: fii_buy += 1
+            else: break
+        else:
+            break
+    return {
+        "recent": rows,
+        "fii_consec_sell": fii_sell,
+        "fii_consec_buy":  fii_buy,
+        "alarm_sell": fii_sell >= 3,
+        "alarm_buy":  fii_buy  >= 3,
+    }
+
+
+def inst_summary_line(pulse: dict | None) -> str:
+    if not pulse:
+        return ""
+    last = pulse["recent"][-1]
+    fii_k = last["fii"] / 1000
+    sign = "+" if fii_k >= 0 else ""
+    base = f"昨日外資 {sign}{fii_k:,.0f}K"
+    if pulse["alarm_sell"]:
+        return f"⚠ 外資連 {pulse['fii_consec_sell']} 日賣超｜{base}"
+    if pulse["alarm_buy"]:
+        return f"🔥 外資連 {pulse['fii_consec_buy']} 日買超｜{base}"
+    return f"📊 {base}"
+
+
 def event_summary_line(ev: dict | None) -> str:
     if not ev:
         return ""
@@ -989,22 +1122,25 @@ def check_stock(code: str, scfg: dict, intraday: dict, cfg: dict):
     buy_r  = buy_analysis(code, price, scfg, intraday)
     sell_r = sell_analysis(code, price, scfg, intraday)
 
-    # 族群 + 新聞 + 大盤 + 美股隔夜 + 法說會視窗（皆有 cache）
+    # 族群 + 新聞 + 大盤 + 美股隔夜 + 法說會 + 三大法人籌碼（皆有 cache）
     pulse     = get_peer_pulse()
     news      = scan_news(code, name)
     market    = get_market_pulse()
     overnight = get_overnight_us()
     event     = get_event_window(code)
-    # 法說會視窗：pre/today/post 都列為 risk（避免追利多 + 警示兌現賣壓）
+    inst      = get_inst_pulse(code)
     in_event  = event is not None
     risk      = (pulse["alarm_down"] or bool(news["bad_hits"]) or
-                 market["alarm"] or overnight["big_drop"] or in_event)
-    boost     = pulse["alarm_up"] or market["boost"] or overnight["big_rally"]
+                 market["alarm"] or overnight["big_drop"] or in_event or
+                 (inst is not None and inst["alarm_sell"]))
+    boost     = (pulse["alarm_up"] or market["boost"] or overnight["big_rally"] or
+                 (inst is not None and inst["alarm_buy"]))
     peer_ln   = peer_summary_line(pulse)
     mkt_ln    = market_summary_line(market)
     ov_ln     = overnight_summary_line(overnight)
     ev_ln     = event_summary_line(event)
-    context   = "\n".join(x for x in (mkt_ln, peer_ln, ov_ln, ev_ln) if x)
+    inst_ln   = inst_summary_line(inst)
+    context   = "\n".join(x for x in (mkt_ln, peer_ln, ov_ln, ev_ln, inst_ln) if x)
     if context:
         context += "\n"
 
@@ -1076,6 +1212,9 @@ def run_check():
         ev = get_event_window(code)
         if ev:
             log.info(f"  {scfg.get('name', code)} {event_summary_line(ev)}")
+        inst = get_inst_pulse(code)
+        if inst and (inst["alarm_sell"] or inst["alarm_buy"]):
+            log.info(f"  {scfg.get('name', code)} {inst_summary_line(inst)}")
     prices = {}
     for code, scfg in cfg.get("stocks", {}).items():
         intraday = get_intraday(code)

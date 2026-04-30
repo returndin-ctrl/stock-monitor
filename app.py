@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 台股監控 Web App（雲端版）
-部署到 Railway（GitHub auto-deploy），以技術指標＋價格位置綜合判斷買賣時機
+部署到 Railway（GitHub webhook auto-deploy），以技術指標＋價格位置綜合判斷買賣時機
 """
 
 import sys, os, time, json, threading, logging, requests, schedule, pytz

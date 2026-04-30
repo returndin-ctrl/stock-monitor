@@ -11,9 +11,10 @@ from datetime import datetime, time as dtime
 from flask import Flask, jsonify, request, render_template
 
 # ── 環境變數 ──────────────────────────────────────────────────────────
-PORT       = int(os.environ.get('PORT', 8080))
-DATA_DIR   = os.environ.get('DATA_DIR', os.path.join(os.path.dirname(__file__), 'data'))
-NTFY_TOPIC = os.environ.get('NTFY_TOPIC', '')
+PORT          = int(os.environ.get('PORT', 8080))
+DATA_DIR      = os.environ.get('DATA_DIR', os.path.join(os.path.dirname(__file__), 'data'))
+TG_BOT_TOKEN  = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+TG_CHAT_ID    = os.environ.get('TELEGRAM_CHAT_ID', '')
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -21,7 +22,8 @@ PORTFOLIO_FILE = os.path.join(DATA_DIR, 'portfolio.json')
 CONFIG_FILE    = os.path.join(DATA_DIR, 'config.json')
 
 DEFAULT_CONFIG = {
-    "ntfy_topic": "",
+    "telegram_bot_token": "",
+    "telegram_chat_id": "",
     "check_interval_minutes": 1,
     "buy_threshold": 5,
     "sell_threshold": 5,
@@ -588,26 +590,39 @@ _monitor_status = {
 }
 
 
-def send_ntfy(title: str, message: str, priority: str = "default") -> bool:
-    topic = NTFY_TOPIC or load_config().get("ntfy_topic", "")
-    if not topic:
-        log.warning("ntfy topic 未設定，跳過推播")
+def _tg_credentials() -> tuple[str, str]:
+    cfg = load_config()
+    token = TG_BOT_TOKEN or cfg.get("telegram_bot_token", "")
+    chat  = TG_CHAT_ID   or cfg.get("telegram_chat_id", "")
+    return token, chat
+
+
+def send_telegram(title: str, message: str, priority: str = "default") -> bool:
+    token, chat = _tg_credentials()
+    if not token or not chat:
+        log.warning("Telegram 憑證未設定，跳過推播")
         return False
     try:
+        text = f"*{title}*\n{message}" if title else message
         r = requests.post(
-            f"https://ntfy.sh/{topic}",
-            data=message.encode("utf-8"),
-            headers={"Title": title, "Priority": priority, "Tags": "chart_increasing"},
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={
+                "chat_id": chat,
+                "text": text,
+                "parse_mode": "Markdown",
+                "disable_web_page_preview": True,
+                "disable_notification": (priority == "low"),
+            },
             timeout=10,
         )
-        ok = r.status_code == 200
+        ok = r.ok
         if ok:
             _monitor_status["notifications_sent"] += 1
         else:
-            log.warning(f"ntfy 回應異常：{r.status_code}")
+            log.warning(f"Telegram 回應異常：{r.status_code} {r.text[:200]}")
         return ok
     except Exception as e:
-        log.error(f"ntfy 通知失敗：{e}")
+        log.error(f"Telegram 通知失敗：{e}")
         return False
 
 
@@ -617,7 +632,7 @@ def notify(alert_key: str, message: str, title: str = "股市通知", priority: 
         return
     _notified[alert_key] = now_ts
     log.info(f"  ➜ 推播：{message[:60]}…")
-    send_ntfy(title, message, priority)
+    send_telegram(title, message, priority)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1005,12 +1020,14 @@ def _monitor_thread():
     try:
         cfg      = load_config()
         interval = cfg.get("check_interval_minutes", 1)
-        topic    = NTFY_TOPIC or cfg.get("ntfy_topic", "")
-        log.info(f"監控執行緒啟動（每 {interval} 分鐘，ntfy={'已設定 '+topic if topic else '未設定⚠'}）")
-        # 啟動確認通知
-        if topic:
-            send_ntfy("股市監控啟動", f"監控執行緒已啟動，每 {interval} 分鐘檢查一次\n"
-                      f"監控股票：{', '.join(cfg.get('stocks', {}).keys())}", "low")
+        token, chat = _tg_credentials()
+        tg_ok = bool(token and chat)
+        log.info(f"監控執行緒啟動（每 {interval} 分鐘，Telegram={'已設定' if tg_ok else '未設定⚠'}）")
+        if tg_ok:
+            send_telegram("股市監控啟動",
+                          f"監控執行緒已啟動，每 {interval} 分鐘檢查一次\n"
+                          f"監控股票：{', '.join(cfg.get('stocks', {}).keys())}",
+                          "low")
         run_check()
         schedule.every(interval).minutes.do(run_check)
         while True:
@@ -1110,11 +1127,11 @@ def api_debug_check():
             "sell_error": sell_r.get("error"),
             "hist_cached": code in _hist_cache,
         }
-    topic = NTFY_TOPIC or cfg.get("ntfy_topic", "")
+    token, chat = _tg_credentials()
     return jsonify({
         "time_tw": datetime.now(TW_TZ).strftime("%Y/%m/%d %H:%M:%S"),
         "market_open": is_market_hours(),
-        "ntfy_topic": topic or "(未設定)",
+        "telegram": "已設定" if (token and chat) else "(未設定)",
         "buy_threshold": cfg.get("buy_threshold", 5),
         "stocks": result,
     })
@@ -1122,12 +1139,14 @@ def api_debug_check():
 
 @app.route("/api/status")
 def api_status():
-    cfg   = load_config()
-    topic = NTFY_TOPIC or cfg.get("ntfy_topic", "")
+    cfg = load_config()
+    token, chat = _tg_credentials()
+    src = "env" if (TG_BOT_TOKEN and TG_CHAT_ID) else \
+          ("config" if (cfg.get("telegram_bot_token") and cfg.get("telegram_chat_id")) else "none")
     return jsonify({
         "monitor": _monitor_status,
-        "ntfy_topic": topic if topic else "(未設定)",
-        "ntfy_topic_source": "env" if NTFY_TOPIC else ("config" if cfg.get("ntfy_topic") else "none"),
+        "telegram": "已設定" if (token and chat) else "(未設定)",
+        "telegram_source": src,
         "market_open": is_market_hours(),
         "now_tw": datetime.now(TW_TZ).strftime("%Y/%m/%d %H:%M:%S"),
         "stocks": list(cfg.get("stocks", {}).keys()),

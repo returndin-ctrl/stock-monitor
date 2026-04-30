@@ -235,19 +235,22 @@ def _twse_intraday(code: str) -> dict | None:
 
 
 def _yahoo_intraday(code: str) -> dict | None:
-    try:
-        hist = yf.Ticker(f"{code}.TW").history(period="2d", interval="1d")
-        if len(hist) < 2:
-            return None
-        price = float(hist["Close"].iloc[-1])
-        prev  = float(hist["Close"].iloc[-2])
-        return {"price": price, "prev_close": prev, "open": None,
-                "high": float(hist["High"].iloc[-1]),
-                "low":  float(hist["Low"].iloc[-1]),
-                "change_pct": (price - prev) / prev * 100,
-                "intraday_pos": None}
-    except Exception:
-        return None
+    # 上市股用 .TW，上櫃股用 .TWO；先試 .TW 沒資料再試 .TWO
+    for suffix in (".TW", ".TWO"):
+        try:
+            hist = yf.Ticker(f"{code}{suffix}").history(period="2d", interval="1d")
+            if len(hist) < 2:
+                continue
+            price = float(hist["Close"].iloc[-1])
+            prev  = float(hist["Close"].iloc[-2])
+            return {"price": price, "prev_close": prev, "open": None,
+                    "high": float(hist["High"].iloc[-1]),
+                    "low":  float(hist["Low"].iloc[-1]),
+                    "change_pct": (price - prev) / prev * 100,
+                    "intraday_pos": None}
+        except Exception:
+            continue
+    return None
 
 
 def get_intraday(code: str) -> dict | None:
@@ -658,6 +661,135 @@ def _holding_note(code: str, price: float) -> str:
             f"未實現損益：{sign}{abs(pnl):,.0f} 元")
 
 
+# ══════════════════════════════════════════════════════════════════════
+# 族群連動偵測（DRAM 同業）
+# ══════════════════════════════════════════════════════════════════════
+
+DRAM_PEERS = {
+    "2344": "華邦電",
+    "3260": "威剛",
+    "4967": "十銓",
+    "6770": "力積電",
+    "8299": "群聯",
+}
+
+_peer_cache = {"data": None, "ts": 0.0}
+_PEER_TTL = 180  # 3 分鐘
+
+
+def get_peer_pulse() -> dict:
+    """族群連動狀態：跌幅 >5% 家數、平均漲跌、明細"""
+    now = time.time()
+    if _peer_cache["data"] and now - _peer_cache["ts"] < _PEER_TTL:
+        return _peer_cache["data"]
+    rows = []
+    for c, n in DRAM_PEERS.items():
+        d = get_intraday(c)
+        if d:
+            rows.append({"code": c, "name": n, "change_pct": d["change_pct"]})
+    if not rows:
+        result = {"down_5": 0, "up_5": 0, "down_3": 0, "avg_pct": 0.0, "rows": [],
+                  "alarm_down": False, "alarm_up": False}
+    else:
+        down_5 = sum(1 for r in rows if r["change_pct"] <= -5)
+        down_3 = sum(1 for r in rows if r["change_pct"] <= -3)
+        up_5   = sum(1 for r in rows if r["change_pct"] >=  5)
+        avg    = sum(r["change_pct"] for r in rows) / len(rows)
+        # 族群弱勢：≥3 檔重挫 OR ≥4 檔跌3% OR 平均跌4%
+        alarm_down = down_5 >= 3 or down_3 >= 4 or avg <= -4
+        alarm_up   = up_5 >= 3
+        result = {"down_5": down_5, "down_3": down_3, "up_5": up_5,
+                  "avg_pct": avg, "rows": rows,
+                  "alarm_down": alarm_down, "alarm_up": alarm_up}
+    _peer_cache["data"] = result
+    _peer_cache["ts"]   = now
+    return result
+
+
+def peer_summary_line(pulse: dict) -> str:
+    if not pulse["rows"]:
+        return ""
+    sign = "↑" if pulse["avg_pct"] >= 0 else "↓"
+    head = f"DRAM 族群均 {sign}{abs(pulse['avg_pct']):.1f}%（{len(pulse['rows'])} 檔）"
+    if pulse["alarm_down"]:
+        bad = [r["name"] for r in pulse["rows"] if r["change_pct"] <= -3]
+        return f"⚠ {head}｜{pulse['down_3']} 檔走弱：{'、'.join(bad)}"
+    if pulse["alarm_up"]:
+        good = [r["name"] for r in pulse["rows"] if r["change_pct"] >= 5]
+        return f"🔥 {head}｜{pulse['up_5']} 檔強漲：{'、'.join(good)}"
+    return f"📊 {head}"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 新聞關鍵字偵測（Yahoo 個股新聞）
+# ══════════════════════════════════════════════════════════════════════
+
+NEWS_KEYWORDS_BAD = [
+    "跌停", "重挫", "崩跌", "暴跌", "失守", "警示股", "處置股",
+    "關稅", "利空", "減產", "降評", "下修", "違規", "停牌",
+]
+NEWS_KEYWORDS_HOT = ["漲停", "創高", "突破", "上修", "利多"]
+
+_news_cache: dict[str, dict] = {}        # code -> {"news": [...], "ts": ...}
+_news_seen:  dict[str, set]  = {}        # code -> 已推過的標題集合
+_NEWS_TTL = 1800                          # 30 分鐘抓一次
+
+
+def fetch_yahoo_news(code: str) -> list[str]:
+    """抓 Yahoo 個股新聞標題（從頁面 JSON payload 解析）"""
+    import re
+    now = time.time()
+    cached = _news_cache.get(code)
+    if cached and now - cached["ts"] < _NEWS_TTL:
+        return cached["news"]
+    try:
+        r = requests.get(
+            f"https://tw.stock.yahoo.com/quote/{code}.TW/news",
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=10,
+        )
+        if not r.ok:
+            return []
+        raw = re.findall(r'"title":"([^"]{10,120})"', r.text)
+        titles = []
+        for t in raw:
+            # 只解 \uXXXX 跟 \/，不要動到 UTF-8 中文
+            t = re.sub(r'\\u([0-9a-fA-F]{4})',
+                       lambda m: chr(int(m.group(1), 16)), t)
+            t = t.replace("\\/", "/")
+            if "Yahoo股市" in t or "相關新聞" in t:
+                continue
+            titles.append(t)
+        news = list(dict.fromkeys(titles))[:20]  # 去重保序、取前 20
+        _news_cache[code] = {"news": news, "ts": now}
+        return news
+    except Exception as e:
+        log.debug(f"Yahoo 新聞抓取失敗 ({code}): {e}")
+        return []
+
+
+def scan_news(code: str, name: str) -> dict:
+    """掃描新出現的關鍵字命中。回傳 {bad_hits, hot_hits, alert_msg}"""
+    titles = fetch_yahoo_news(code)
+    seen = _news_seen.setdefault(code, set())
+    bad_hits, hot_hits = [], []
+    for t in titles:
+        if t in seen:
+            continue
+        b = [k for k in NEWS_KEYWORDS_BAD if k in t]
+        h = [k for k in NEWS_KEYWORDS_HOT if k in t]
+        if b or h:
+            seen.add(t)
+            if b: bad_hits.append({"title": t, "kw": b})
+            if h: hot_hits.append({"title": t, "kw": h})
+    alert_msg = None
+    if bad_hits:
+        lines = [f"📰 {name}（{code}）出現 {len(bad_hits)} 條負面新聞"]
+        for x in bad_hits[:3]:
+            lines.append(f"  ⚠ {x['title']}（{'/'.join(x['kw'])}）")
+        alert_msg = "\n".join(lines)
+    return {"bad_hits": bad_hits, "hot_hits": hot_hits, "alert_msg": alert_msg}
+
+
 def check_stock(code: str, scfg: dict, intraday: dict, cfg: dict):
     price    = intraday["price"]
     name     = scfg.get("name", code)
@@ -669,15 +801,36 @@ def check_stock(code: str, scfg: dict, intraday: dict, cfg: dict):
     buy_r  = buy_analysis(code, price, scfg, intraday)
     sell_r = sell_analysis(code, price, scfg, intraday)
 
+    # 族群連動 + 新聞掃描（兩者皆有 cache）
+    pulse    = get_peer_pulse()
+    news     = scan_news(code, name)
+    risk     = pulse["alarm_down"] or bool(news["bad_hits"])
+    boost    = pulse["alarm_up"]
+    peer_ln  = peer_summary_line(pulse)
+    context  = f"{peer_ln}\n" if peer_ln else ""
+
+    # 風險旗標：抑制買訊、加強賣訊
+    eff_buy_thr  = buy_thr  + (1 if risk  else 0)
+    eff_sell_thr = sell_thr - (1 if risk  else 0)
+    # 族群同步噴出時，買訊門檻降 1（順勢）
+    if boost and not risk:
+        eff_buy_thr = max(buy_thr - 1, 3)
+
     holding      = _load()["holdings"].get(code, {})
     has_position = bool(holding)
 
     b_score = buy_r.get("score", 0) if "error" not in buy_r else 0
     s_score = sell_r.get("score", 0) if "error" not in sell_r else 0
 
-    # 買訊：達門檻，且買分 > 賣分（避免訊號衝突）
-    if "error" not in buy_r and b_score >= buy_thr and b_score > s_score:
+    # 獨立的負面新聞警示（不受買賣訊冷卻影響、有自己的 alert_key）
+    if news["alert_msg"]:
+        notify(f"{code}_news", news["alert_msg"] + f"\n⏰ {now_s}",
+               f"新聞警示｜{name}", "high")
+
+    # 買訊：達（調整後）門檻、買分 > 賣分、且非風險狀態
+    if "error" not in buy_r and b_score >= eff_buy_thr and b_score > s_score and not risk:
         msg = (f"🟢 {name}（{code}）{buy_r['level']}\n"
+               f"{context}"
                f"{_price_line(intraday)}\n"
                f"{decision_line(buy_r)}"
                f"{_suggest_shares(code, scfg, price)}"
@@ -685,7 +838,7 @@ def check_stock(code: str, scfg: dict, intraday: dict, cfg: dict):
                f"⏰ {now_s}")
         notify(f"{code}_buy", msg, f"買進訊號｜{name}", "high")
 
-    if has_position and not scfg.get("no_sell_alert") and "error" not in sell_r and s_score >= sell_thr and s_score > b_score:
+    if has_position and not scfg.get("no_sell_alert") and "error" not in sell_r and s_score >= eff_sell_thr and s_score > b_score:
         avg_cost = holding["avg_cost"]
         pnl_pct  = (price - avg_cost) / avg_cost * 100
         if pnl_pct <= -5:
@@ -694,7 +847,9 @@ def check_stock(code: str, scfg: dict, intraday: dict, cfg: dict):
             icon, action = "🔴", "建議停利出場"
         else:
             icon, action = "🟠", "建議減碼觀察"
-        msg = (f"{icon} {name}（{code}）{action}\n"
+        risk_tag = "（族群+新聞風險，門檻已下調）" if risk else ""
+        msg = (f"{icon} {name}（{code}）{action}{risk_tag}\n"
+               f"{context}"
                f"{_price_line(intraday)}\n"
                f"{decision_line(sell_r)}"
                f"{_holding_note(code, price)}\n"
@@ -712,6 +867,9 @@ def run_check():
     log.info(f"{'─'*40}")
     log.info(f"[{now_s}] 開始檢查股價")
     _monitor_status["checks_today"] += 1
+    pulse = get_peer_pulse()
+    if pulse["rows"]:
+        log.info(f"  {peer_summary_line(pulse)}")
     prices = {}
     for code, scfg in cfg.get("stocks", {}).items():
         intraday = get_intraday(code)

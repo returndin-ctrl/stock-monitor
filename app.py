@@ -790,6 +790,102 @@ def scan_news(code: str, name: str) -> dict:
     return {"bad_hits": bad_hits, "hot_hits": hot_hits, "alert_msg": alert_msg}
 
 
+# ══════════════════════════════════════════════════════════════════════
+# 大盤即時 + 美股隔夜（宏觀情勢）
+# ══════════════════════════════════════════════════════════════════════
+
+_market_cache    = {"data": None, "ts": 0.0}
+_overnight_cache = {"data": None, "ts": 0.0}
+_MARKET_TTL      = 180     # 大盤 3 分鐘
+_OVERNIGHT_TTL   = 1800    # 美股隔夜 30 分鐘（盤中不會變）
+
+
+def _yf_change(symbol: str) -> dict | None:
+    try:
+        df = yf.Ticker(symbol).history(period="5d", interval="1d")
+        if len(df) < 2:
+            return None
+        today = float(df["Close"].iloc[-1])
+        prev  = float(df["Close"].iloc[-2])
+        return {"close": today, "change_pct": (today - prev) / prev * 100}
+    except Exception as e:
+        log.debug(f"yfinance 失敗 ({symbol}): {e}")
+        return None
+
+
+def get_market_pulse() -> dict:
+    """加權指數 + 台積電即時狀態。alarm: 加權跌>1% OR 2330 跌>2%"""
+    now = time.time()
+    if _market_cache["data"] and now - _market_cache["ts"] < _MARKET_TTL:
+        return _market_cache["data"]
+    twii = _yf_change("^TWII")
+    tsmc = get_intraday("2330")  # 用既有的雙來源（TWSE + yfinance）
+    twii_cp = twii["change_pct"] if twii else None
+    tsmc_cp = tsmc["change_pct"] if tsmc else None
+    alarm = (twii_cp is not None and twii_cp <= -1) or (tsmc_cp is not None and tsmc_cp <= -2)
+    boost = (twii_cp is not None and twii_cp >=  1) and (tsmc_cp is not None and tsmc_cp >= 1)
+    result = {"twii_cp": twii_cp, "tsmc_cp": tsmc_cp, "alarm": alarm, "boost": boost}
+    _market_cache["data"] = result
+    _market_cache["ts"]   = now
+    return result
+
+
+def market_summary_line(mp: dict) -> str:
+    if mp["twii_cp"] is None and mp["tsmc_cp"] is None:
+        return ""
+    parts = []
+    if mp["twii_cp"] is not None:
+        s = "↑" if mp["twii_cp"] >= 0 else "↓"
+        parts.append(f"加權 {s}{abs(mp['twii_cp']):.2f}%")
+    if mp["tsmc_cp"] is not None:
+        s = "↑" if mp["tsmc_cp"] >= 0 else "↓"
+        parts.append(f"台積電 {s}{abs(mp['tsmc_cp']):.2f}%")
+    head = "｜".join(parts)
+    if mp["alarm"]:
+        return f"⚠ 大盤 {head}"
+    if mp["boost"]:
+        return f"🔥 大盤 {head}"
+    return f"📊 大盤 {head}"
+
+
+def get_overnight_us() -> dict:
+    """美股隔夜表現：SOX、TSM ADR、NVDA。big_drop: 任一檔 ≤ -2.5%"""
+    now = time.time()
+    if _overnight_cache["data"] and now - _overnight_cache["ts"] < _OVERNIGHT_TTL:
+        return _overnight_cache["data"]
+    syms = {"^SOX": "SOX", "TSM": "TSM-ADR", "NVDA": "NVDA"}
+    rows = {}
+    for sym, label in syms.items():
+        d = _yf_change(sym)
+        if d:
+            rows[sym] = {"label": label, "change_pct": d["change_pct"]}
+    changes  = [r["change_pct"] for r in rows.values()]
+    avg      = sum(changes) / len(changes) if changes else 0.0
+    big_drop = any(c <= -2.5 for c in changes)
+    big_rally = any(c >=  2.5 for c in changes)
+    result = {"rows": rows, "avg": avg, "big_drop": big_drop, "big_rally": big_rally}
+    _overnight_cache["data"] = result
+    _overnight_cache["ts"]   = now
+    return result
+
+
+def overnight_summary_line(ov: dict) -> str:
+    if not ov["rows"]:
+        return ""
+    parts = []
+    for sym in ("^SOX", "TSM", "NVDA"):
+        r = ov["rows"].get(sym)
+        if r:
+            s = "+" if r["change_pct"] >= 0 else ""
+            parts.append(f"{r['label']} {s}{r['change_pct']:.1f}%")
+    head = "隔夜 " + "｜".join(parts)
+    if ov["big_drop"]:
+        return f"⚠ {head}（半導體重挫，跳空風險）"
+    if ov["big_rally"]:
+        return f"🔥 {head}（半導體大漲）"
+    return f"📊 {head}"
+
+
 def check_stock(code: str, scfg: dict, intraday: dict, cfg: dict):
     price    = intraday["price"]
     name     = scfg.get("name", code)
@@ -801,13 +897,20 @@ def check_stock(code: str, scfg: dict, intraday: dict, cfg: dict):
     buy_r  = buy_analysis(code, price, scfg, intraday)
     sell_r = sell_analysis(code, price, scfg, intraday)
 
-    # 族群連動 + 新聞掃描（兩者皆有 cache）
-    pulse    = get_peer_pulse()
-    news     = scan_news(code, name)
-    risk     = pulse["alarm_down"] or bool(news["bad_hits"])
-    boost    = pulse["alarm_up"]
-    peer_ln  = peer_summary_line(pulse)
-    context  = f"{peer_ln}\n" if peer_ln else ""
+    # 族群連動 + 新聞 + 大盤 + 美股隔夜（皆有 cache）
+    pulse     = get_peer_pulse()
+    news      = scan_news(code, name)
+    market    = get_market_pulse()
+    overnight = get_overnight_us()
+    risk      = (pulse["alarm_down"] or bool(news["bad_hits"]) or
+                 market["alarm"] or overnight["big_drop"])
+    boost     = pulse["alarm_up"] or market["boost"] or overnight["big_rally"]
+    peer_ln   = peer_summary_line(pulse)
+    mkt_ln    = market_summary_line(market)
+    ov_ln     = overnight_summary_line(overnight)
+    context   = "\n".join(x for x in (mkt_ln, peer_ln, ov_ln) if x)
+    if context:
+        context += "\n"
 
     # 風險旗標：抑制買訊、加強賣訊
     eff_buy_thr  = buy_thr  + (1 if risk  else 0)
@@ -867,9 +970,12 @@ def run_check():
     log.info(f"{'─'*40}")
     log.info(f"[{now_s}] 開始檢查股價")
     _monitor_status["checks_today"] += 1
-    pulse = get_peer_pulse()
-    if pulse["rows"]:
-        log.info(f"  {peer_summary_line(pulse)}")
+    market    = get_market_pulse()
+    overnight = get_overnight_us()
+    pulse     = get_peer_pulse()
+    if (mkt := market_summary_line(market)):       log.info(f"  {mkt}")
+    if (ov  := overnight_summary_line(overnight)): log.info(f"  {ov}")
+    if pulse["rows"]:                              log.info(f"  {peer_summary_line(pulse)}")
     prices = {}
     for code, scfg in cfg.get("stocks", {}).items():
         intraday = get_intraday(code)

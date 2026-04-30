@@ -23,7 +23,7 @@ CONFIG_FILE    = os.path.join(DATA_DIR, 'config.json')
 DEFAULT_CONFIG = {
     "ntfy_topic": "",
     "check_interval_minutes": 1,
-    "buy_threshold": 4,
+    "buy_threshold": 5,
     "sell_threshold": 5,
     "stocks": {
         "2330": {
@@ -662,7 +662,7 @@ def check_stock(code: str, scfg: dict, intraday: dict, cfg: dict):
     price    = intraday["price"]
     name     = scfg.get("name", code)
     now_s    = datetime.now(TW_TZ).strftime("%Y/%m/%d %H:%M")
-    buy_thr  = cfg.get("buy_threshold", 4)
+    buy_thr  = cfg.get("buy_threshold", 5)
     sell_thr = cfg.get("sell_threshold", 5)
 
     log.info(f"  分析技術指標（{name} {code}）…")
@@ -830,8 +830,8 @@ def api_debug_check():
         price = intraday["price"]
         buy_r  = buy_analysis(code, price, scfg, intraday)
         sell_r = sell_analysis(code, price, scfg, intraday)
-        buy_thr  = cfg.get("buy_threshold", 3)
-        sell_thr = cfg.get("sell_threshold", 3)
+        buy_thr  = cfg.get("buy_threshold", 5)
+        sell_thr = cfg.get("sell_threshold", 5)
         has_pos  = bool(_load()["holdings"].get(code))
         result[code] = {
             "name":       scfg.get("name", code),
@@ -851,7 +851,7 @@ def api_debug_check():
         "time_tw": datetime.now(TW_TZ).strftime("%Y/%m/%d %H:%M:%S"),
         "market_open": is_market_hours(),
         "ntfy_topic": topic or "(未設定)",
-        "buy_threshold": cfg.get("buy_threshold", 3),
+        "buy_threshold": cfg.get("buy_threshold", 5),
         "stocks": result,
     })
 

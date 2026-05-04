@@ -292,9 +292,14 @@ def _fetch_history(code: str, current_price: float | None = None) -> pd.DataFram
         df = cached_df.copy()
     else:
         try:
-            df = yf.Ticker(f"{code}.TW").history(period="90d", interval="1d")
-            if len(df) < 30:
-                log.warning(f"  {code} 歷史資料不足（{len(df)} 筆）")
+            df = None
+            for suffix in (".TW", ".TWO"):  # 上市 / 上櫃 fallback
+                df_try = yf.Ticker(f"{code}{suffix}").history(period="90d", interval="1d")
+                if len(df_try) >= 30:
+                    df = df_try
+                    break
+            if df is None:
+                log.warning(f"  {code} 歷史資料不足（< 30 筆，TW/TWO 都試過）")
                 return None
             _hist_cache[code] = (now, df.copy())
             log.info(f"  {code} 歷史資料更新（{len(df)} 筆）")
@@ -796,15 +801,21 @@ def fetch_yahoo_news(code: str) -> list[str]:
 
 
 def scan_news(code: str, name: str) -> dict:
-    """掃描新出現的關鍵字命中。回傳 {bad_hits, hot_hits, alert_msg}"""
+    """掃描新聞。
+    bad_hits/hot_hits: 只有「未推過 alert」的新標題（推播用、避免洗版）
+    has_bad_news/has_hot_news: 當前頁面是否有任何負/正面標題（risk gating 用）
+    """
     titles = fetch_yahoo_news(code)
     seen = _news_seen.setdefault(code, set())
     bad_hits, hot_hits = [], []
+    has_bad, has_hot = False, False
     for t in titles:
-        if t in seen:
-            continue
         b = [k for k in NEWS_KEYWORDS_BAD if k in t]
         h = [k for k in NEWS_KEYWORDS_HOT if k in t]
+        if b: has_bad = True
+        if h: has_hot = True
+        if t in seen:
+            continue
         if b or h:
             seen.add(t)
             if b: bad_hits.append({"title": t, "kw": b})
@@ -815,7 +826,9 @@ def scan_news(code: str, name: str) -> dict:
         for x in bad_hits[:3]:
             lines.append(f"  ⚠ {x['title']}（{'/'.join(x['kw'])}）")
         alert_msg = "\n".join(lines)
-    return {"bad_hits": bad_hits, "hot_hits": hot_hits, "alert_msg": alert_msg}
+    return {"bad_hits": bad_hits, "hot_hits": hot_hits,
+            "has_bad_news": has_bad, "has_hot_news": has_hot,
+            "alert_msg": alert_msg}
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1143,7 +1156,7 @@ def check_stock(code: str, scfg: dict, intraday: dict, cfg: dict):
     event     = get_event_window(code)
     inst      = get_inst_pulse(code)
     in_event  = event is not None
-    risk      = (pulse["alarm_down"] or bool(news["bad_hits"]) or
+    risk      = (pulse["alarm_down"] or news["has_bad_news"] or
                  market["alarm"] or overnight["big_drop"] or in_event or
                  (inst is not None and inst["alarm_sell"]))
     boost     = (pulse["alarm_up"] or market["boost"] or overnight["big_rally"] or

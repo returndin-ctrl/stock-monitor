@@ -26,7 +26,7 @@ DEFAULT_CONFIG = {
     "telegram_chat_id": "",
     "check_interval_minutes": 1,
     "buy_threshold": 5,
-    "sell_threshold": 5,
+    "sell_threshold": 3,
     "stocks": {
         "0050": {"name": "元大台灣50", "budget": 50000, "support_price": 70, "resistance_price": 90, "no_sell_alert": True},
         "2303": {"name": "聯電",       "budget": 50000, "support_price": 53,   "resistance_price": 80},

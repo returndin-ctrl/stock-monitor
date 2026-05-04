@@ -213,10 +213,30 @@ def _twse_intraday(code: str) -> dict | None:
         def _f(k):
             v = item.get(k, "")
             return float(v) if v and v != "-" else None
-        price = _f("z") or _f("y")
-        prev  = _f("y")
-        high  = _f("h")
-        low   = _f("l")
+        def _first_nonzero(stack: str):
+            for p in (stack or "").split("_"):
+                try:
+                    v = float(p)
+                    if v > 0:
+                        return v
+                except Exception:
+                    pass
+            return None
+        prev = _f("y")
+        high = _f("h")
+        low  = _f("l")
+        # 撮合空檔（z 空）時依序 fallback：上一筆成交 → 買一/賣一中點 → 今日高低中點 → 昨收
+        price = _f("z") or _f("pz")
+        if price is None:
+            bid = _first_nonzero(item.get("b", ""))
+            ask = _first_nonzero(item.get("a", ""))
+            if bid and ask:   price = (bid + ask) / 2
+            elif bid:         price = bid
+            elif ask:         price = ask
+        if price is None and high and low:
+            price = (high + low) / 2
+        if price is None:
+            price = prev
         if not price or not prev:
             return None
         change_pct   = (price - prev) / prev * 100

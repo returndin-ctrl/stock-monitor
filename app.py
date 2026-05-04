@@ -28,11 +28,11 @@ DEFAULT_CONFIG = {
     "buy_threshold": 5,
     "sell_threshold": 3,
     "stocks": {
-        "0050": {"name": "元大台灣50", "budget": 50000, "support_price": 70, "resistance_price": 90, "no_sell_alert": True},
+        "0050": {"name": "元大台灣50", "budget": 50000, "support_price": 70,   "resistance_price": 90,   "no_sell_alert": True},
         "2303": {"name": "聯電",       "budget": 50000, "support_price": 53,   "resistance_price": 80},
-        "2308": {"name": "台達電",     "budget": 50000, "support_price": 2000, "resistance_price": 2280},
+        "2308": {"name": "台達電",     "budget": 50000, "support_price": 2000, "resistance_price": 2280, "peer_group": "AI_SERVER"},
         "2330": {"name": "台積電",     "budget": 50000, "support_price": 1760, "resistance_price": 2180},
-        "2408": {"name": "南亞科",     "budget": 50000, "support_price": 198,  "resistance_price": 249},
+        "2408": {"name": "南亞科",     "budget": 50000, "support_price": 198,  "resistance_price": 249,  "peer_group": "DRAM"},
     }
 }
 
@@ -312,7 +312,11 @@ def _fetch_history(code: str, current_price: float | None = None) -> pd.DataFram
                 return None
     if current_price:
         df = df.copy()
-        df.loc[df.index[-1], "Close"] = current_price
+        last = df.index[-1]
+        df.loc[last, "Close"] = current_price
+        # high/low 也同步擴張，避免 KD/盤中位置等指標用過期區間
+        df.loc[last, "High"] = max(float(df.loc[last, "High"]), current_price)
+        df.loc[last, "Low"]  = min(float(df.loc[last, "Low"]),  current_price)
     return df
 
 
@@ -698,31 +702,43 @@ def _holding_note(code: str, price: float) -> str:
 # 族群連動偵測（DRAM 同業）
 # ══════════════════════════════════════════════════════════════════════
 
-DRAM_PEERS = {
-    "2344": "華邦電",
-    "3260": "威剛",
-    "4967": "十銓",
-    "6770": "力積電",
-    "8299": "群聯",
+PEER_GROUPS = {
+    "DRAM": {
+        "label": "DRAM 族群",
+        "peers": {"2344": "華邦電", "3260": "威剛", "4967": "十銓",
+                  "6770": "力積電", "8299": "群聯"},
+    },
+    "AI_SERVER": {
+        "label": "AI 伺服器族群",
+        "peers": {"2317": "鴻海", "2382": "廣達", "3231": "緯創",
+                  "6669": "緯穎", "2308": "台達電"},
+    },
 }
 
-_peer_cache = {"data": None, "ts": 0.0}
+_peer_cache: dict[str, dict] = {}  # group_name -> {"data": ..., "ts": ...}
 _PEER_TTL = 180  # 3 分鐘
 
 
-def get_peer_pulse() -> dict:
+def get_peer_pulse(group: str = "DRAM") -> dict:
     """族群連動狀態：跌幅 >5% 家數、平均漲跌、明細"""
+    if group not in PEER_GROUPS:
+        return {"down_5": 0, "down_3": 0, "up_5": 0, "avg_pct": 0.0,
+                "rows": [], "alarm_down": False, "alarm_up": False,
+                "label": ""}
     now = time.time()
-    if _peer_cache["data"] and now - _peer_cache["ts"] < _PEER_TTL:
-        return _peer_cache["data"]
+    cached = _peer_cache.get(group)
+    if cached and now - cached["ts"] < _PEER_TTL:
+        return cached["data"]
+    peers = PEER_GROUPS[group]["peers"]
+    label = PEER_GROUPS[group]["label"]
     rows = []
-    for c, n in DRAM_PEERS.items():
+    for c, n in peers.items():
         d = get_intraday(c)
         if d:
             rows.append({"code": c, "name": n, "change_pct": d["change_pct"]})
     if not rows:
         result = {"down_5": 0, "up_5": 0, "down_3": 0, "avg_pct": 0.0, "rows": [],
-                  "alarm_down": False, "alarm_up": False}
+                  "alarm_down": False, "alarm_up": False, "label": label}
     else:
         down_5 = sum(1 for r in rows if r["change_pct"] <= -5)
         down_3 = sum(1 for r in rows if r["change_pct"] <= -3)
@@ -733,17 +749,18 @@ def get_peer_pulse() -> dict:
         alarm_up   = up_5 >= 3
         result = {"down_5": down_5, "down_3": down_3, "up_5": up_5,
                   "avg_pct": avg, "rows": rows,
-                  "alarm_down": alarm_down, "alarm_up": alarm_up}
-    _peer_cache["data"] = result
-    _peer_cache["ts"]   = now
+                  "alarm_down": alarm_down, "alarm_up": alarm_up,
+                  "label": label}
+    _peer_cache[group] = {"data": result, "ts": now}
     return result
 
 
 def peer_summary_line(pulse: dict) -> str:
     if not pulse["rows"]:
         return ""
-    sign = "↑" if pulse["avg_pct"] >= 0 else "↓"
-    head = f"DRAM 族群均 {sign}{abs(pulse['avg_pct']):.1f}%（{len(pulse['rows'])} 檔）"
+    sign  = "↑" if pulse["avg_pct"] >= 0 else "↓"
+    label = pulse.get("label", "族群")
+    head = f"{label}均 {sign}{abs(pulse['avg_pct']):.1f}%（{len(pulse['rows'])} 檔）"
     if pulse["alarm_down"]:
         bad = [r["name"] for r in pulse["rows"] if r["change_pct"] <= -3]
         return f"⚠ {head}｜{pulse['down_3']} 檔走弱：{'、'.join(bad)}"
@@ -1039,15 +1056,26 @@ def fetch_twse_t86(date_str: str) -> dict | None:
 
 
 def update_t86() -> dict:
-    """抓最近 5 個交易日的 T86 並更新 history（缺漏才抓）"""
+    """抓最近 5 個交易日的 T86 並更新 history（缺漏才抓）。
+    智能 TTL：盤後 17:30 後若今日資料還沒抓到，強制重抓。"""
     now = time.time()
-    if _t86_cache["data"] and now - _t86_cache["ts"] < _T86_TTL:
+    today_dt   = datetime.now(TW_TZ)
+    today_date = today_dt.date()
+    today_str  = today_date.strftime("%Y%m%d")
+    history    = _t86_load()
+
+    after_release = (today_dt.hour, today_dt.minute) >= (17, 30)
+    is_weekday    = today_date.weekday() < 5
+    needs_today   = after_release and is_weekday and today_str not in history
+
+    if (_t86_cache["data"] and
+        now - _t86_cache["ts"] < _T86_TTL and
+        not needs_today):
         return _t86_cache["data"]
-    history = _t86_load()
-    today = datetime.now(TW_TZ).date()
+
     found = 0
     for n in range(10):  # 倒回最多 10 天找 5 個交易日
-        d = today - timedelta(days=n)
+        d = today_date - timedelta(days=n)
         if d.weekday() >= 5:
             continue
         date_str = d.strftime("%Y%m%d")
@@ -1149,19 +1177,22 @@ def check_stock(code: str, scfg: dict, intraday: dict, cfg: dict):
     sell_r = sell_analysis(code, price, scfg, intraday)
 
     # 族群 + 新聞 + 大盤 + 美股隔夜 + 法說會 + 三大法人籌碼（皆有 cache）
-    pulse     = get_peer_pulse()
+    peer_grp  = scfg.get("peer_group")  # None 則不查族群
+    pulse     = get_peer_pulse(peer_grp) if peer_grp else None
     news      = scan_news(code, name)
     market    = get_market_pulse()
     overnight = get_overnight_us()
     event     = get_event_window(code)
     inst      = get_inst_pulse(code)
     in_event  = event is not None
-    risk      = (pulse["alarm_down"] or news["has_bad_news"] or
+    peer_down = pulse is not None and pulse["alarm_down"]
+    peer_up   = pulse is not None and pulse["alarm_up"]
+    risk      = (peer_down or news["has_bad_news"] or
                  market["alarm"] or overnight["big_drop"] or in_event or
                  (inst is not None and inst["alarm_sell"]))
-    boost     = (pulse["alarm_up"] or market["boost"] or overnight["big_rally"] or
+    boost     = (peer_up or market["boost"] or overnight["big_rally"] or
                  (inst is not None and inst["alarm_buy"]))
-    peer_ln   = peer_summary_line(pulse)
+    peer_ln   = peer_summary_line(pulse) if pulse else ""
     mkt_ln    = market_summary_line(market)
     ov_ln     = overnight_summary_line(overnight)
     ev_ln     = event_summary_line(event)
@@ -1230,19 +1261,25 @@ def run_check():
     _monitor_status["checks_today"] += 1
     market    = get_market_pulse()
     overnight = get_overnight_us()
-    pulse     = get_peer_pulse()
     if (mkt := market_summary_line(market)):       log.info(f"  {mkt}")
     if (ov  := overnight_summary_line(overnight)): log.info(f"  {ov}")
-    if pulse["rows"]:                              log.info(f"  {peer_summary_line(pulse)}")
+    # 收集本次 cfg 用到的所有 peer group，每個只 log 一次
+    used_groups = {scfg.get("peer_group") for scfg in cfg.get("stocks", {}).values()
+                   if scfg.get("peer_group")}
+    for g in used_groups:
+        p = get_peer_pulse(g)
+        if p["rows"]:
+            log.info(f"  {peer_summary_line(p)}")
+    prices = {}
     for code, scfg in cfg.get("stocks", {}).items():
+        # 個股事件 / 籌碼提示
         ev = get_event_window(code)
         if ev:
             log.info(f"  {scfg.get('name', code)} {event_summary_line(ev)}")
         inst = get_inst_pulse(code)
         if inst and (inst["alarm_sell"] or inst["alarm_buy"]):
             log.info(f"  {scfg.get('name', code)} {inst_summary_line(inst)}")
-    prices = {}
-    for code, scfg in cfg.get("stocks", {}).items():
+        # 抓即時價並執行檢查
         intraday = get_intraday(code)
         if not intraday:
             log.warning(f"  {scfg.get('name', code)} ({code})：無法取得股價")
@@ -1266,31 +1303,37 @@ def run_check():
 
 
 def _monitor_thread():
-    _monitor_status["running"] = True
-    try:
-        cfg      = load_config()
-        interval = cfg.get("check_interval_minutes", 1)
-        token, chat = _tg_credentials()
-        tg_ok = bool(token and chat)
-        log.info(f"監控執行緒啟動（每 {interval} 分鐘，Telegram={'已設定' if tg_ok else '未設定⚠'}）")
-        if tg_ok:
-            send_telegram("股市監控啟動",
-                          f"監控執行緒已啟動，每 {interval} 分鐘檢查一次\n"
-                          f"監控股票：{', '.join(cfg.get('stocks', {}).keys())}",
-                          "low")
-        run_check()
-        schedule.every(interval).minutes.do(run_check)
-        while True:
-            try:
-                schedule.run_pending()
-            except Exception as e:
-                log.error(f"排程執行錯誤：{e}")
-                _monitor_status["last_error"] = str(e)
-            time.sleep(5)
-    except Exception as e:
-        _monitor_status["running"] = False
-        _monitor_status["last_error"] = str(e)
-        log.error(f"監控執行緒崩潰：{e}")
+    crash_count = 0
+    while True:
+        try:
+            _monitor_status["running"] = True
+            cfg      = load_config()
+            interval = cfg.get("check_interval_minutes", 1)
+            token, chat = _tg_credentials()
+            tg_ok = bool(token and chat)
+            kind = "重啟" if crash_count > 0 else "啟動"
+            log.info(f"監控執行緒{kind}（每 {interval} 分鐘，Telegram={'已設定' if tg_ok else '未設定⚠'}）")
+            if tg_ok and crash_count == 0:
+                send_telegram("股市監控啟動",
+                              f"監控執行緒已啟動，每 {interval} 分鐘檢查一次\n"
+                              f"監控股票：{', '.join(cfg.get('stocks', {}).keys())}",
+                              "low")
+            schedule.clear()  # 重啟時清除舊 jobs，避免重複註冊
+            run_check()
+            schedule.every(interval).minutes.do(run_check)
+            while True:
+                try:
+                    schedule.run_pending()
+                except Exception as e:
+                    log.error(f"排程執行錯誤：{e}")
+                    _monitor_status["last_error"] = str(e)
+                time.sleep(5)
+        except Exception as e:
+            crash_count += 1
+            _monitor_status["running"] = False
+            _monitor_status["last_error"] = f"crash#{crash_count}: {e}"
+            log.error(f"監控執行緒崩潰（第 {crash_count} 次）：{e}，30 秒後重啟")
+            time.sleep(30)
 
 
 # ══════════════════════════════════════════════════════════════════════

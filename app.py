@@ -4,7 +4,7 @@
 部署到 Railway（GitHub webhook auto-deploy），以技術指標＋價格位置綜合判斷買賣時機
 """
 
-import sys, os, time, json, threading, logging, requests, schedule, pytz
+import sys, os, time, json, threading, logging, requests, schedule, pytz, sqlite3
 import pandas as pd
 import yfinance as yf
 from datetime import datetime, time as dtime, timedelta
@@ -57,6 +57,77 @@ TW_TZ         = pytz.timezone('Asia/Taipei')
 BUY_FEE_RATE  = 0.001425
 SELL_FEE_RATE = 0.001425
 SELL_TAX_RATE = 0.003
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 訊號資料庫（SQLite）— 用於回測 + 週報
+# ══════════════════════════════════════════════════════════════════════
+
+SIGNAL_DB = os.path.join(DATA_DIR, 'signals.db')
+_db_lock = threading.Lock()
+
+
+def _db_conn():
+    return sqlite3.connect(SIGNAL_DB, timeout=10)
+
+
+def _db_init():
+    with _db_lock, _db_conn() as conn:
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                code TEXT NOT NULL,
+                name TEXT,
+                signal_type TEXT NOT NULL,
+                score INTEGER,
+                threshold INTEGER,
+                price REAL,
+                pnl_pct REAL,
+                risk_flag INTEGER,
+                risk_reasons TEXT,
+                message TEXT
+            )''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(timestamp)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_signals_code ON signals(code)')
+
+
+def record_signal(code: str, name: str, signal_type: str,
+                  score: int = None, threshold: int = None,
+                  price: float = None, pnl_pct: float = None,
+                  risk_flag: bool = False, risk_reasons: dict = None,
+                  message: str = ""):
+    try:
+        ts = datetime.now(TW_TZ).isoformat()
+        with _db_lock, _db_conn() as conn:
+            conn.execute('''
+                INSERT INTO signals (timestamp, code, name, signal_type, score, threshold,
+                                     price, pnl_pct, risk_flag, risk_reasons, message)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (ts, code, name, signal_type, score, threshold,
+                  price, pnl_pct, int(bool(risk_flag)),
+                  json.dumps(risk_reasons or {}, ensure_ascii=False),
+                  (message or "")[:500]))
+    except Exception as e:
+        log.debug(f"record_signal failed ({code} {signal_type}): {e}")
+
+
+def query_signals(start_ts: str = None, end_ts: str = None) -> list:
+    sql = "SELECT * FROM signals"
+    where, params = [], []
+    if start_ts:
+        where.append("timestamp >= ?"); params.append(start_ts)
+    if end_ts:
+        where.append("timestamp <= ?"); params.append(end_ts)
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY timestamp"
+    with _db_lock, _db_conn() as conn:
+        conn.row_factory = sqlite3.Row
+        return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+
+_db_init()
 
 
 def _load() -> dict:
@@ -1214,10 +1285,21 @@ def check_stock(code: str, scfg: dict, intraday: dict, cfg: dict):
     b_score = buy_r.get("score", 0) if "error" not in buy_r else 0
     s_score = sell_r.get("score", 0) if "error" not in sell_r else 0
 
+    risk_reasons = {
+        "peer_down":   peer_down,
+        "news_bad":    news["has_bad_news"],
+        "market":      market["alarm"],
+        "overnight":   overnight["big_drop"],
+        "event":       in_event,
+        "inst_sell":   bool(inst and inst["alarm_sell"]),
+    }
+
     # 獨立的負面新聞警示（不受買賣訊冷卻影響、有自己的 alert_key）
     if news["alert_msg"]:
         notify(f"{code}_news", news["alert_msg"] + f"\n⏰ {now_s}",
                f"新聞警示｜{name}", "high")
+        record_signal(code, name, "news", price=price, risk_flag=True,
+                      risk_reasons=risk_reasons, message=news["alert_msg"])
 
     # 買訊：達（調整後）門檻、買分 > 賣分、且非風險狀態
     if "error" not in buy_r and b_score >= eff_buy_thr and b_score > s_score and not risk:
@@ -1229,6 +1311,14 @@ def check_stock(code: str, scfg: dict, intraday: dict, cfg: dict):
                f"{_holding_note(code, price)}\n"
                f"⏰ {now_s}")
         notify(f"{code}_buy", msg, f"買進訊號｜{name}", "high")
+        record_signal(code, name, "buy", score=b_score, threshold=eff_buy_thr,
+                      price=price, risk_flag=False,
+                      risk_reasons=risk_reasons, message=msg)
+    elif "error" not in buy_r and b_score >= buy_thr and risk:
+        # 達原始門檻但被 risk 抑制：仍記錄（但不推播）— 用於回測「有 risk 抑制 vs 沒抑制」對比
+        record_signal(code, name, "buy_suppressed", score=b_score, threshold=buy_thr,
+                      price=price, risk_flag=True, risk_reasons=risk_reasons,
+                      message=f"buy_score={b_score} 達門檻但 risk=True 抑制")
 
     if has_position and not scfg.get("no_sell_alert") and "error" not in sell_r and s_score >= eff_sell_thr and s_score > b_score:
         avg_cost = holding["avg_cost"]
@@ -1247,6 +1337,148 @@ def check_stock(code: str, scfg: dict, intraday: dict, cfg: dict):
                f"{_holding_note(code, price)}\n"
                f"⏰ {now_s}")
         notify(f"{code}_sell", msg, f"賣出訊號｜{name}", "urgent" if pnl_pct <= -5 else "high")
+        record_signal(code, name, "sell", score=s_score, threshold=eff_sell_thr,
+                      price=price, pnl_pct=pnl_pct, risk_flag=risk,
+                      risk_reasons=risk_reasons, message=msg)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 訊號回測 + quantstats 週報
+# ══════════════════════════════════════════════════════════════════════
+
+def backtest_signals(start_ts: str = None, end_ts: str = None) -> dict:
+    """重放 signal DB 訊號當作交易，產出每筆 closed trade 與每日報酬序列"""
+    rows = query_signals(start_ts, end_ts)
+    positions: dict = {}     # code -> {entry_price, entry_ts}
+    trades: list = []
+    for r in rows:
+        sig = r["signal_type"]
+        code = r["code"]
+        price = r["price"]
+        if price is None:
+            continue
+        if sig == "buy" and code not in positions:
+            positions[code] = {"entry_price": price, "entry_ts": r["timestamp"]}
+        elif sig == "sell" and code in positions:
+            pos = positions.pop(code)
+            ret = (price - pos["entry_price"]) / pos["entry_price"]
+            trades.append({
+                "code": code, "name": r["name"],
+                "open_ts": pos["entry_ts"], "close_ts": r["timestamp"],
+                "entry_price": pos["entry_price"], "exit_price": price,
+                "return": ret,
+            })
+    return {"trades": trades, "open_positions": positions, "raw_count": len(rows)}
+
+
+def _trades_to_daily_returns(trades: list):
+    """把交易序列轉成每日報酬 pandas Series"""
+    if not trades:
+        return None
+    df = pd.DataFrame(trades)
+    df["close_date"] = pd.to_datetime(df["close_ts"]).dt.tz_localize(None).dt.date
+    daily = df.groupby("close_date")["return"].sum()
+    daily.index = pd.to_datetime(daily.index)
+    # 補齊缺日（沒交易那天 = 0 報酬）
+    full_range = pd.date_range(daily.index.min(), daily.index.max(), freq='D')
+    daily = daily.reindex(full_range, fill_value=0)
+    return daily
+
+
+def generate_weekly_report(weeks: int = 1) -> str | None:
+    """產生 quantstats HTML 報表，回傳檔案路徑"""
+    try:
+        import quantstats as qs
+    except ImportError:
+        log.warning("quantstats 未安裝，無法產生週報")
+        return None
+    end   = datetime.now(TW_TZ)
+    start = end - timedelta(weeks=weeks)
+    bt    = backtest_signals(start.isoformat(), end.isoformat())
+    if not bt["trades"]:
+        log.info(f"近 {weeks} 週無已完成交易，跳過週報")
+        return None
+    daily = _trades_to_daily_returns(bt["trades"])
+    if daily is None or len(daily) < 2:
+        return None
+    out_path = os.path.join(DATA_DIR, f'report_{end.strftime("%Y%m%d")}.html')
+    try:
+        qs.reports.html(daily, output=out_path,
+                        title=f"Stock Monitor 週報 ({start.strftime('%m/%d')}-{end.strftime('%m/%d')})")
+    except Exception as e:
+        log.error(f"quantstats 報表生成失敗：{e}")
+        return None
+    return out_path
+
+
+def send_telegram_document(file_path: str, caption: str = "") -> bool:
+    """送檔案（HTML/PDF）到 Telegram"""
+    token, chat = _tg_credentials()
+    if not (token and chat):
+        return False
+    try:
+        with open(file_path, 'rb') as f:
+            r = requests.post(
+                f"https://api.telegram.org/bot{token}/sendDocument",
+                data={"chat_id": chat, "caption": caption},
+                files={"document": f},
+                timeout=60,
+            )
+        if not r.ok:
+            log.warning(f"Telegram sendDocument 異常：{r.status_code} {r.text[:200]}")
+        return r.ok
+    except Exception as e:
+        log.error(f"Telegram 檔案上傳失敗：{e}")
+        return False
+
+
+def _trade_summary_text(bt: dict) -> str:
+    """產出交易摘要文字（搭配 HTML 報表寄出）"""
+    trades = bt["trades"]
+    if not trades:
+        return "本週無已完成交易"
+    n = len(trades)
+    wins = sum(1 for t in trades if t["return"] > 0)
+    avg_ret = sum(t["return"] for t in trades) / n
+    total_ret = sum(t["return"] for t in trades)
+    best = max(trades, key=lambda t: t["return"])
+    worst = min(trades, key=lambda t: t["return"])
+    lines = [
+        f"📊 *Stock Monitor 週報*",
+        f"• 交易數：{n} 筆（勝 {wins}）",
+        f"• 平均單筆報酬：{avg_ret*100:+.2f}%",
+        f"• 總累計報酬：{total_ret*100:+.2f}%",
+        f"• 最佳：{best['name']}({best['code']}) {best['return']*100:+.1f}%",
+        f"• 最差：{worst['name']}({worst['code']}) {worst['return']*100:+.1f}%",
+        f"• 仍持倉：{len(bt['open_positions'])} 檔",
+    ]
+    return "\n".join(lines)
+
+
+def _run_weekly_report():
+    """產生週報並推送（無條件跑）"""
+    log.info("執行週報生成…")
+    end   = datetime.now(TW_TZ)
+    start = end - timedelta(weeks=1)
+    bt    = backtest_signals(start.isoformat(), end.isoformat())
+    if not bt["trades"]:
+        send_telegram("週報", "本週無已完成交易（沒有觸發過完整 buy→sell 週期）", "low")
+        return
+    summary = _trade_summary_text(bt)
+    send_telegram("Stock Monitor 週報", summary, "high")
+    path = generate_weekly_report(weeks=1)
+    if path and os.path.exists(path):
+        send_telegram_document(path, "📊 完整 quantstats 報表")
+        log.info("週報已寄出")
+    else:
+        log.info("quantstats 詳細報表生成失敗，僅推文字摘要")
+
+
+def weekly_report_job():
+    """排程用：每週日台北時間 21:00 執行"""
+    if datetime.now(TW_TZ).weekday() != 6:  # 0=Mon, 6=Sun
+        return
+    _run_weekly_report()
 
 
 def run_check():
@@ -1321,6 +1553,8 @@ def _monitor_thread():
             schedule.clear()  # 重啟時清除舊 jobs，避免重複註冊
             run_check()
             schedule.every(interval).minutes.do(run_check)
+            # 週報：UTC 13:00 = 台北時間 21:00；每天觸發但 job 內部判斷只在週日跑
+            schedule.every().day.at("13:00").do(weekly_report_job)
             while True:
                 try:
                     schedule.run_pending()
@@ -1457,6 +1691,34 @@ def api_set_config():
     with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
         json.dump(new_cfg, f, ensure_ascii=False, indent=2)
     return jsonify({"ok": True})
+
+
+@app.route("/api/signals")
+def api_signals():
+    """查詢訊號歷史。?days=7 限定最近 N 天。"""
+    days = int(request.args.get("days", 7))
+    start = (datetime.now(TW_TZ) - timedelta(days=days)).isoformat()
+    rows = query_signals(start_ts=start)
+    return jsonify({"count": len(rows), "rows": rows})
+
+
+@app.route("/api/backtest")
+def api_backtest():
+    days = int(request.args.get("days", 7))
+    start = (datetime.now(TW_TZ) - timedelta(days=days)).isoformat()
+    bt = backtest_signals(start_ts=start)
+    return jsonify({
+        "trades": bt["trades"],
+        "open_positions": bt["open_positions"],
+        "raw_signal_count": bt["raw_count"],
+    })
+
+
+@app.route("/api/weekly_report", methods=["POST"])
+def api_weekly_report():
+    """手動觸發週報（不限週日）"""
+    threading.Thread(target=_run_weekly_report, daemon=True).start()
+    return jsonify({"ok": True, "message": "週報生成中，完成後會推 Telegram"})
 
 
 @app.route("/")

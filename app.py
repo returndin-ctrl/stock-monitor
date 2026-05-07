@@ -32,6 +32,7 @@ DEFAULT_CONFIG = {
         "0050": {"name": "元大台灣50", "budget": 50000, "support_price": 70,   "resistance_price": 90,   "no_sell_alert": True},
         "2303": {"name": "聯電",       "budget": 50000, "support_price": 53,   "resistance_price": 80},
         "2308": {"name": "台達電",     "budget": 50000, "support_price": 2000, "resistance_price": 2280, "peer_group": "AI_SERVER"},
+        "2324": {"name": "仁寶",       "budget": 50000, "support_price": 28,   "resistance_price": 33},
         "2330": {"name": "台積電",     "budget": 50000, "support_price": 1760, "resistance_price": 2180},
         "2408": {"name": "南亞科",     "budget": 50000, "support_price": 198,  "resistance_price": 249,  "peer_group": "DRAM"},
     }

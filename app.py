@@ -1589,9 +1589,15 @@ def monthly_reset_check():
     last_reset = data.get("last_reset_month")
     if last_reset == cur_month:
         return  # 已經重置過
+    if last_reset is None:
+        # 首次啟動：只記錄月份，不動 cash（保留現有資料）
+        data["last_reset_month"] = cur_month
+        _save(data)
+        log.info(f"月初檢查首次啟動：記錄 {cur_month}，不重置 cash")
+        return
 
     last_cash = data.get("cash", 0)
-    used_last = monthly_budget - last_cash if last_reset else 0
+    used_last = monthly_budget - last_cash
 
     # 上月買入摘要（給 Telegram）
     last_month_str = (now - relativedelta(months=1)).strftime("%Y/%m")
@@ -1604,16 +1610,15 @@ def monthly_reset_check():
     _save(data)
     log.info(f"月初重置：cash 補回 {monthly_budget:,.0f}（上月用 {used_last:,.0f}）")
 
-    if last_reset:  # 第一次部署不發通知
-        lines = [
-            f"已將現金補回 {monthly_budget:,.0f} 元（{cur_month} 月預算）",
-            "",
-            f"上月（{last_month_str}）回顧：",
-            f"  共買入 {len(last_buys)} 筆，用掉 {used_last:,.0f} 元",
-        ]
-        for t in last_buys[:10]:
-            lines.append(f"  • {t['time'][:10]} {t['name']}({t['code']}) {t['shares']}股 @ {t['price']:,.0f}")
-        notify(f"monthly_reset_{cur_month}", "\n".join(lines), "月初預算重置", "low")
+    lines = [
+        f"已將現金補回 {monthly_budget:,.0f} 元（{cur_month} 月預算）",
+        "",
+        f"上月（{last_month_str}）回顧：",
+        f"  共買入 {len(last_buys)} 筆，用掉 {used_last:,.0f} 元",
+    ]
+    for t in last_buys[:10]:
+        lines.append(f"  • {t['time'][:10]} {t['name']}({t['code']}) {t['shares']}股 @ {t['price']:,.0f}")
+    notify(f"monthly_reset_{cur_month}", "\n".join(lines), "月初預算重置", "low")
 
 
 def _monitor_thread():

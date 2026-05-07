@@ -1592,7 +1592,7 @@ def monthly_reset_check():
     if last_reset is None:
         # 首次啟動：只記錄月份，不動 cash（保留現有資料）
         data["last_reset_month"] = cur_month
-        _save(data)
+        _pf_save(data)
         log.info(f"月初檢查首次啟動：記錄 {cur_month}，不重置 cash")
         return
 
@@ -1607,7 +1607,7 @@ def monthly_reset_check():
     # 重置
     data["cash"] = monthly_budget
     data["last_reset_month"] = cur_month
-    _save(data)
+    _pf_save(data)
     log.info(f"月初重置：cash 補回 {monthly_budget:,.0f}（上月用 {used_last:,.0f}）")
 
     lines = [
@@ -1727,7 +1727,7 @@ def api_import_holding():
         "avg_cost": avg_cost,
         "total_cost": shares * avg_cost,
     }
-    _save(data)
+    _pf_save(data)
     return jsonify({"ok": True, "holdings": data["holdings"][code]})
 
 
@@ -1738,7 +1738,7 @@ def api_delete_holding():
     code = str(d["code"])
     data = _load()
     removed = data["holdings"].pop(code, None)
-    _save(data)
+    _pf_save(data)
     return jsonify({"ok": True, "removed": removed})
 
 

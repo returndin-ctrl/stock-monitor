@@ -8,7 +8,6 @@ import sys, os, time, json, threading, logging, requests, schedule, pytz, sqlite
 import pandas as pd
 import yfinance as yf
 from datetime import datetime, time as dtime, timedelta
-from dateutil.relativedelta import relativedelta
 from flask import Flask, jsonify, request, render_template
 
 # ── 環境變數 ──────────────────────────────────────────────────────────
@@ -28,6 +27,7 @@ DEFAULT_CONFIG = {
     "check_interval_minutes": 1,
     "buy_threshold": 5,
     "sell_threshold": 3,
+    "initial_cash": 50000,
     "stocks": {
         "0050": {"name": "元大台灣50", "budget": 50000, "support_price": 70,   "resistance_price": 90,   "no_sell_alert": True},
         "2303": {"name": "聯電",       "budget": 50000, "support_price": 53,   "resistance_price": 80},
@@ -754,17 +754,13 @@ def _price_line(intraday: dict) -> str:
 
 def _suggest_shares(code: str, scfg: dict, price: float, cfg: dict | None = None,
                      score: int | None = None) -> str:
-    """依本月共用預算池 × 訊號強度比例算建議股數
+    """依可用現金 × 訊號強度比例算建議股數
        score 4 → 50%、5 → 75%、≥6 → 100%"""
-    cfg = cfg or load_config()
-    monthly_budget = cfg.get("monthly_budget")
-    if not monthly_budget or price <= 0:
+    if price <= 0:
         return ""
     cash = _load().get("cash", 0)
-    used = monthly_budget - cash
-    remaining = cash
-    if remaining <= 0:
-        return f"\n💰 本月預算已用完（月預算 {monthly_budget:,.0f}，已用 {used:,.0f}）"
+    if cash <= 0:
+        return f"\n💰 現金不足（目前餘額 {cash:,.0f}）"
 
     if score is None or score >= 6:
         fraction, label = 1.0, "全額（極強訊號）"
@@ -773,12 +769,12 @@ def _suggest_shares(code: str, scfg: dict, price: float, cfg: dict | None = None
     else:
         fraction, label = 0.5, "50%（標準強訊號）"
 
-    allocate = remaining * fraction
+    allocate = cash * fraction
     shares = int(allocate // price)
     if shares <= 0:
-        return f"\n💰 本月剩餘 {remaining:,.0f} 元，買不到 1 股 @ {price:,.0f}"
+        return f"\n💰 可用現金 {cash:,.0f} 元，買不到 1 股 @ {price:,.0f}"
     return (f"\n📌 建議買入：{shares} 股 — {label}：{shares*price:,.0f} 元 @ {price:,.0f}"
-            f"\n   本月剩餘 {remaining:,.0f}（月預算 {monthly_budget:,.0f}，已用 {used:,.0f}）")
+            f"\n   可用現金 {cash:,.0f}")
 
 
 def _suggest_sell_shares(code: str, price: float, fraction: float, hint: str = "") -> str:
@@ -1579,49 +1575,21 @@ def run_check():
         notify(f"portfolio_hourly_{now.hour}", "\n".join(lines), "持倉摘要")
 
 
-def monthly_reset_check():
-    """月初檢查：若上次重置不是這個月，就把 cash 補回 monthly_budget 並推 Telegram。
-    每次呼叫都檢查，因此 container 重啟後仍能正確補上。"""
+def initial_cash_check():
+    """首次啟動：若 cash 為 0 且尚未初始化過，就把 cash 設為 initial_cash。
+    之後 cash 隨買賣自然變動，不再做月度重置。"""
     cfg = load_config()
-    monthly_budget = cfg.get("monthly_budget")
-    if not monthly_budget:
+    initial_cash = cfg.get("initial_cash")
+    if not initial_cash:
         return
-    now = datetime.now(TW_TZ)
-    cur_month = now.strftime("%Y-%m")
     data = _load()
-    last_reset = data.get("last_reset_month")
-    if last_reset == cur_month:
-        return  # 已經重置過
-    if last_reset is None:
-        # 首次啟動：只記錄月份，不動 cash（保留現有資料）
-        data["last_reset_month"] = cur_month
-        _pf_save(data)
-        log.info(f"月初檢查首次啟動：記錄 {cur_month}，不重置 cash")
+    if data.get("cash_initialized"):
         return
-
-    last_cash = data.get("cash", 0)
-    used_last = monthly_budget - last_cash
-
-    # 上月買入摘要（給 Telegram）
-    last_month_str = (now - relativedelta(months=1)).strftime("%Y/%m")
-    last_buys = [t for t in data.get("transactions", [])
-                 if t.get("action") == "buy" and t.get("time", "").startswith(last_month_str)]
-
-    # 重置
-    data["cash"] = monthly_budget
-    data["last_reset_month"] = cur_month
+    if data.get("cash", 0) == 0 and not data.get("transactions"):
+        data["cash"] = initial_cash
+        log.info(f"首次啟動：cash 設為起始金額 {initial_cash:,.0f}")
+    data["cash_initialized"] = True
     _pf_save(data)
-    log.info(f"月初重置：cash 補回 {monthly_budget:,.0f}（上月用 {used_last:,.0f}）")
-
-    lines = [
-        f"已將現金補回 {monthly_budget:,.0f} 元（{cur_month} 月預算）",
-        "",
-        f"上月（{last_month_str}）回顧：",
-        f"  共買入 {len(last_buys)} 筆，用掉 {used_last:,.0f} 元",
-    ]
-    for t in last_buys[:10]:
-        lines.append(f"  • {t['time'][:10]} {t['name']}({t['code']}) {t['shares']}股 @ {t['price']:,.0f}")
-    notify(f"monthly_reset_{cur_month}", "\n".join(lines), "月初預算重置", "low")
 
 
 def _monitor_thread():
@@ -1641,11 +1609,9 @@ def _monitor_thread():
                               f"監控股票：{', '.join(cfg.get('stocks', {}).keys())}",
                               "low")
             schedule.clear()  # 重啟時清除舊 jobs，避免重複註冊
-            monthly_reset_check()  # 啟動時先檢查一次（container restart 時 catch-up）
+            initial_cash_check()  # 首次啟動時設定起始現金
             run_check()
             schedule.every(interval).minutes.do(run_check)
-            # 月初預算重置：每小時檢查（內部判斷月份是否變動）
-            schedule.every().hour.do(monthly_reset_check)
             # 週報：UTC 13:00 = 台北時間 21:00；每天觸發但 job 內部判斷只在週日跑
             schedule.every().day.at("13:00").do(weekly_report_job)
             while True:

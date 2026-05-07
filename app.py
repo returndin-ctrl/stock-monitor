@@ -658,15 +658,18 @@ def get_prices() -> dict:
     now = time.time()
     if now - _last_fetch > 30:
         cfg   = load_config()
+        # 監控清單 ∪ 持倉
+        codes = set(cfg.get("stocks", {}).keys())
+        codes.update(_load().get("holdings", {}).keys())
         fresh = {}
-        for code in cfg.get("stocks", {}):
+        for code in codes:
             d = get_intraday(code)
             if d:
                 fresh[code] = d["price"]
         with _cache_lock:
             if fresh:
                 _cache = fresh
-            _last_fetch = now
+                _last_fetch = now
     with _cache_lock:
         return dict(_cache)
 

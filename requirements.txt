@@ -5,5 +5,6 @@ pandas>=2.0
 numpy>=1.26
 schedule>=1.2
 pytz>=2024.1
+python-dateutil>=2.9
 gunicorn>=22.0
 quantstats>=0.0.62

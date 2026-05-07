@@ -8,6 +8,7 @@ import sys, os, time, json, threading, logging, requests, schedule, pytz, sqlite
 import pandas as pd
 import yfinance as yf
 from datetime import datetime, time as dtime, timedelta
+from dateutil.relativedelta import relativedelta
 from flask import Flask, jsonify, request, render_template
 
 # ── 環境變數 ──────────────────────────────────────────────────────────
@@ -395,8 +396,12 @@ def _rsi(close: pd.Series, n: int = 14) -> float:
     delta = close.diff()
     gain  = delta.clip(lower=0).rolling(n).mean()
     loss  = (-delta.clip(upper=0)).rolling(n).mean()
-    rs    = gain / loss.replace(0, float("inf"))
-    return float(100 - 100 / (1 + rs.iloc[-1]))
+    last_gain = float(gain.iloc[-1])
+    last_loss = float(loss.iloc[-1])
+    if last_loss == 0:
+        return 100.0 if last_gain > 0 else 50.0
+    rs = last_gain / last_loss
+    return float(100 - 100 / (1 + rs))
 
 
 def _macd(close: pd.Series):
@@ -723,9 +728,10 @@ def notify(alert_key: str, message: str, title: str = "股市通知", priority: 
     now_ts = time.time()
     if now_ts - _notified.get(alert_key, 0) < NOTIFY_COOLDOWN_SEC:
         return
-    _notified[alert_key] = now_ts
     log.info(f"  ➜ 推播：{message[:60]}…")
-    send_telegram(title, message, priority)
+    if send_telegram(title, message, priority):
+        _notified[alert_key] = now_ts
+    # 失敗時不更新 cooldown，下一輪會重試
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -743,19 +749,49 @@ def _price_line(intraday: dict) -> str:
     return f"現價 {price:,.0f}｜今日 {sign}{abs(cp):.1f}%{pos_s}{hl_s}"
 
 
-def _suggest_shares(code: str, scfg: dict, price: float) -> str:
-    budget = scfg.get("budget")
-    if not budget or price <= 0:
+def _suggest_shares(code: str, scfg: dict, price: float, cfg: dict | None = None,
+                     score: int | None = None) -> str:
+    """依本月共用預算池 × 訊號強度比例算建議股數
+       score 4 → 50%、5 → 75%、≥6 → 100%"""
+    cfg = cfg or load_config()
+    monthly_budget = cfg.get("monthly_budget")
+    if not monthly_budget or price <= 0:
         return ""
-    invested  = _load()["holdings"].get(code, {}).get("total_cost", 0.0)
-    remaining = budget - invested
+    cash = _load().get("cash", 0)
+    used = monthly_budget - cash
+    remaining = cash
     if remaining <= 0:
-        return f"\n💰 預算已用完（已投入 {invested:,.0f} / {budget:,.0f} 元）"
-    shares = int(remaining // price)
+        return f"\n💰 本月預算已用完（月預算 {monthly_budget:,.0f}，已用 {used:,.0f}）"
+
+    if score is None or score >= 6:
+        fraction, label = 1.0, "全額（極強訊號）"
+    elif score == 5:
+        fraction, label = 0.75, "75%（強訊號）"
+    else:
+        fraction, label = 0.5, "50%（標準強訊號）"
+
+    allocate = remaining * fraction
+    shares = int(allocate // price)
     if shares <= 0:
-        return f"\n💰 剩餘預算不足買入 1 股（剩 {remaining:,.0f} 元）"
-    return (f"\n📌 建議買入：{shares} 股零股（現價 {price:,.0f} 元，約需 {shares*price:,.0f} 元）"
-            f"\n   剩餘預算 {remaining:,.0f} 元（預算 {budget:,.0f}，已投入 {invested:,.0f}）")
+        return f"\n💰 本月剩餘 {remaining:,.0f} 元，買不到 1 股 @ {price:,.0f}"
+    return (f"\n📌 建議買入：{shares} 股 — {label}：{shares*price:,.0f} 元 @ {price:,.0f}"
+            f"\n   本月剩餘 {remaining:,.0f}（月預算 {monthly_budget:,.0f}，已用 {used:,.0f}）")
+
+
+def _suggest_sell_shares(code: str, price: float, fraction: float, hint: str = "") -> str:
+    """依持倉 × 比例算出建議賣出股數"""
+    h = _load()["holdings"].get(code, {})
+    if not h:
+        return ""
+    shares = h["shares"]
+    if shares <= 0:
+        return ""
+    sell_n   = max(1, int(shares * fraction))
+    pct      = int(round(fraction * 100))
+    proceeds = sell_n * price
+    note     = f"（{hint}）" if hint else ""
+    return (f"\n📌 建議賣出：{sell_n} 股{note}"
+            f"\n   佔持倉 {pct}%（共 {shares} 股），約可入帳 {proceeds:,.0f} 元（未扣稅費）")
 
 
 def _holding_note(code: str, price: float) -> str:
@@ -1301,20 +1337,22 @@ def check_stock(code: str, scfg: dict, intraday: dict, cfg: dict):
         record_signal(code, name, "news", price=price, risk_flag=True,
                       risk_reasons=risk_reasons, message=news["alert_msg"])
 
-    # 買訊：達（調整後）門檻、買分 > 賣分、且非風險狀態
-    if "error" not in buy_r and b_score >= eff_buy_thr and b_score > s_score and not risk:
+    # 買訊：達（調整後）門檻、買分 > 賣分、且非風險狀態（sell_only 標的跳過買訊）
+    sell_only = scfg.get("sell_only", False)
+    if (not sell_only and "error" not in buy_r and b_score >= eff_buy_thr
+            and b_score > s_score and not risk):
         msg = (f"🟢 {name}（{code}）{buy_r['level']}\n"
                f"{context}"
                f"{_price_line(intraday)}\n"
                f"{decision_line(buy_r)}"
-               f"{_suggest_shares(code, scfg, price)}"
+               f"{_suggest_shares(code, scfg, price, cfg, b_score)}"
                f"{_holding_note(code, price)}\n"
                f"⏰ {now_s}")
         notify(f"{code}_buy", msg, f"買進訊號｜{name}", "high")
         record_signal(code, name, "buy", score=b_score, threshold=eff_buy_thr,
                       price=price, risk_flag=False,
                       risk_reasons=risk_reasons, message=msg)
-    elif "error" not in buy_r and b_score >= buy_thr and risk:
+    elif not sell_only and "error" not in buy_r and b_score >= buy_thr and risk:
         # 達原始門檻但被 risk 抑制：仍記錄（但不推播）— 用於回測「有 risk 抑制 vs 沒抑制」對比
         record_signal(code, name, "buy_suppressed", score=b_score, threshold=buy_thr,
                       price=price, risk_flag=True, risk_reasons=risk_reasons,
@@ -1325,15 +1363,19 @@ def check_stock(code: str, scfg: dict, intraday: dict, cfg: dict):
         pnl_pct  = (price - avg_cost) / avg_cost * 100
         if pnl_pct <= -5:
             icon, action = "🚨", "建議停損出場"
+            sell_hint = _suggest_sell_shares(code, price, 1.0, "全數出場")
         elif pnl_pct >= 5:
             icon, action = "🔴", "建議停利出場"
+            sell_hint = _suggest_sell_shares(code, price, 0.5, "先賣一半")
         else:
             icon, action = "🟠", "建議減碼觀察"
+            sell_hint = ""
         risk_tag = "（族群+新聞風險，門檻已下調）" if risk else ""
         msg = (f"{icon} {name}（{code}）{action}{risk_tag}\n"
                f"{context}"
                f"{_price_line(intraday)}\n"
                f"{decision_line(sell_r)}"
+               f"{sell_hint}"
                f"{_holding_note(code, price)}\n"
                f"⏰ {now_s}")
         notify(f"{code}_sell", msg, f"賣出訊號｜{name}", "urgent" if pnl_pct <= -5 else "high")
@@ -1534,6 +1576,46 @@ def run_check():
         notify(f"portfolio_hourly_{now.hour}", "\n".join(lines), "持倉摘要")
 
 
+def monthly_reset_check():
+    """月初檢查：若上次重置不是這個月，就把 cash 補回 monthly_budget 並推 Telegram。
+    每次呼叫都檢查，因此 container 重啟後仍能正確補上。"""
+    cfg = load_config()
+    monthly_budget = cfg.get("monthly_budget")
+    if not monthly_budget:
+        return
+    now = datetime.now(TW_TZ)
+    cur_month = now.strftime("%Y-%m")
+    data = _load()
+    last_reset = data.get("last_reset_month")
+    if last_reset == cur_month:
+        return  # 已經重置過
+
+    last_cash = data.get("cash", 0)
+    used_last = monthly_budget - last_cash if last_reset else 0
+
+    # 上月買入摘要（給 Telegram）
+    last_month_str = (now - relativedelta(months=1)).strftime("%Y/%m")
+    last_buys = [t for t in data.get("transactions", [])
+                 if t.get("action") == "buy" and t.get("time", "").startswith(last_month_str)]
+
+    # 重置
+    data["cash"] = monthly_budget
+    data["last_reset_month"] = cur_month
+    _save(data)
+    log.info(f"月初重置：cash 補回 {monthly_budget:,.0f}（上月用 {used_last:,.0f}）")
+
+    if last_reset:  # 第一次部署不發通知
+        lines = [
+            f"已將現金補回 {monthly_budget:,.0f} 元（{cur_month} 月預算）",
+            "",
+            f"上月（{last_month_str}）回顧：",
+            f"  共買入 {len(last_buys)} 筆，用掉 {used_last:,.0f} 元",
+        ]
+        for t in last_buys[:10]:
+            lines.append(f"  • {t['time'][:10]} {t['name']}({t['code']}) {t['shares']}股 @ {t['price']:,.0f}")
+        notify(f"monthly_reset_{cur_month}", "\n".join(lines), "月初預算重置", "low")
+
+
 def _monitor_thread():
     crash_count = 0
     while True:
@@ -1551,8 +1633,11 @@ def _monitor_thread():
                               f"監控股票：{', '.join(cfg.get('stocks', {}).keys())}",
                               "low")
             schedule.clear()  # 重啟時清除舊 jobs，避免重複註冊
+            monthly_reset_check()  # 啟動時先檢查一次（container restart 時 catch-up）
             run_check()
             schedule.every(interval).minutes.do(run_check)
+            # 月初預算重置：每小時檢查（內部判斷月份是否變動）
+            schedule.every().hour.do(monthly_reset_check)
             # 週報：UTC 13:00 = 台北時間 21:00；每天觸發但 job 內部判斷只在週日跑
             schedule.every().day.at("13:00").do(weekly_report_job)
             while True:
@@ -1618,6 +1703,38 @@ def api_cash():
     d = request.json or {}
     set_cash(float(d["amount"]))
     return jsonify({"ok": True})
+
+
+@app.route("/api/import_holding", methods=["POST"])
+def api_import_holding():
+    """直接寫入既有持倉（不扣現金、不建交易紀錄）。
+    用於匯入月初前就買進的部位。
+    payload: {code, name, shares, avg_cost}"""
+    d = request.json or {}
+    code     = str(d["code"])
+    name     = str(d.get("name", code))
+    shares   = int(d["shares"])
+    avg_cost = float(d["avg_cost"])
+    data = _load()
+    data["holdings"][code] = {
+        "name": name,
+        "shares": shares,
+        "avg_cost": avg_cost,
+        "total_cost": shares * avg_cost,
+    }
+    _save(data)
+    return jsonify({"ok": True, "holdings": data["holdings"][code]})
+
+
+@app.route("/api/delete_holding", methods=["POST"])
+def api_delete_holding():
+    """刪除指定持倉（不影響現金、不建交易紀錄）。"""
+    d = request.json or {}
+    code = str(d["code"])
+    data = _load()
+    removed = data["holdings"].pop(code, None)
+    _save(data)
+    return jsonify({"ok": True, "removed": removed})
 
 
 @app.route("/api/history")

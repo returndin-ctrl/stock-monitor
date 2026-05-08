@@ -1340,7 +1340,7 @@ def check_stock(code: str, scfg: dict, intraday: dict, cfg: dict):
     # 買訊：達（調整後）門檻、買分 > 賣分、且非風險狀態（sell_only 標的跳過買訊）
     sell_only = scfg.get("sell_only", False)
     if (not sell_only and "error" not in buy_r and b_score >= eff_buy_thr
-            and b_score > s_score and not risk):
+            and b_score > s_score):
         msg = (f"🟢 {name}（{code}）{buy_r['level']}\n"
                f"{context}"
                f"{_price_line(intraday)}\n"

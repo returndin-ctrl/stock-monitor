@@ -934,6 +934,9 @@ def scan_news(code: str, name: str) -> dict:
     bad_hits, hot_hits = [], []
     has_bad, has_hot = False, False
     for t in titles:
+        # 標題沒指名該標的（名稱或代號）就忽略，避免大盤/類股新聞誤觸
+        if name not in t and code not in t:
+            continue
         b = [k for k in NEWS_KEYWORDS_BAD if k in t]
         h = [k for k in NEWS_KEYWORDS_HOT if k in t]
         if b: has_bad = True

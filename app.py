@@ -888,8 +888,32 @@ NEWS_KEYWORDS_BAD = [
 NEWS_KEYWORDS_HOT = ["漲停", "創高", "突破", "上修", "利多"]
 
 _news_cache: dict[str, dict] = {}        # code -> {"news": [...], "ts": ...}
-_news_seen:  dict[str, set]  = {}        # code -> 已推過的標題集合
 _NEWS_TTL = 1800                          # 30 分鐘抓一次
+_NEWS_SEEN_FILE = os.path.join(DATA_DIR, 'news_seen.json')
+_NEWS_SEEN_MAX_PER_CODE = 200             # 每檔最多保留最近 200 條已推過的標題
+
+
+def _news_seen_load() -> dict[str, set]:
+    if not os.path.exists(_NEWS_SEEN_FILE):
+        return {}
+    try:
+        with open(_NEWS_SEEN_FILE, encoding='utf-8') as f:
+            raw = json.load(f)
+        return {k: set(v) for k, v in raw.items()}
+    except Exception:
+        return {}
+
+
+def _news_seen_save(seen: dict[str, set]):
+    try:
+        out = {k: list(v)[-_NEWS_SEEN_MAX_PER_CODE:] for k, v in seen.items()}
+        with open(_NEWS_SEEN_FILE, 'w', encoding='utf-8') as f:
+            json.dump(out, f, ensure_ascii=False)
+    except Exception as e:
+        log.debug(f"news_seen 寫檔失敗: {e}")
+
+
+_news_seen: dict[str, set] = _news_seen_load()  # code -> 已推過的標題集合（持久化）
 
 
 def fetch_yahoo_news(code: str) -> list[str]:
@@ -933,6 +957,7 @@ def scan_news(code: str, name: str) -> dict:
     seen = _news_seen.setdefault(code, set())
     bad_hits, hot_hits = [], []
     has_bad, has_hot = False, False
+    new_titles = False
     for t in titles:
         # 標題沒指名該標的（名稱或代號）就忽略，避免大盤/類股新聞誤觸
         if name not in t and code not in t:
@@ -945,8 +970,11 @@ def scan_news(code: str, name: str) -> dict:
             continue
         if b or h:
             seen.add(t)
+            new_titles = True
             if b: bad_hits.append({"title": t, "kw": b})
             if h: hot_hits.append({"title": t, "kw": h})
+    if new_titles:
+        _news_seen_save(_news_seen)
     alert_msg = None
     if bad_hits:
         lines = [f"📰 {name}（{code}）出現 {len(bad_hits)} 條負面新聞"]
@@ -1297,7 +1325,8 @@ def check_stock(code: str, scfg: dict, intraday: dict, cfg: dict):
     in_event  = event is not None
     peer_down = pulse is not None and pulse["alarm_down"]
     peer_up   = pulse is not None and pulse["alarm_up"]
-    risk      = (peer_down or news["has_bad_news"] or
+    # 新聞純推播，不再參與 risk 評分（避免誤觸抑制買賣訊）
+    risk      = (peer_down or
                  market["alarm"] or overnight["big_drop"] or in_event or
                  (inst is not None and inst["alarm_sell"]))
     boost     = (peer_up or market["boost"] or overnight["big_rally"] or
@@ -1373,7 +1402,7 @@ def check_stock(code: str, scfg: dict, intraday: dict, cfg: dict):
         else:
             icon, action = "🟠", "建議減碼觀察"
             sell_hint = ""
-        risk_tag = "（族群+新聞風險，門檻已下調）" if risk else ""
+        risk_tag = "（族群/大盤風險，門檻已下調）" if risk else ""
         msg = (f"{icon} {name}（{code}）{action}{risk_tag}\n"
                f"{context}"
                f"{_price_line(intraday)}\n"

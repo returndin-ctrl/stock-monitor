@@ -1396,12 +1396,12 @@ def check_stock(code: str, scfg: dict, intraday: dict, cfg: dict):
         if pnl_pct <= -5:
             icon, action = "🚨", "建議停損出場"
             sell_hint = _suggest_sell_shares(code, price, 1.0, "全數出場")
-        elif pnl_pct >= 5:
+        elif pnl_pct >= 3:
             icon, action = "🔴", "建議停利出場"
             sell_hint = _suggest_sell_shares(code, price, 0.5, "先賣一半")
         else:
             icon, action = "🟠", "建議減碼觀察"
-            sell_hint = ""
+            sell_hint = _suggest_sell_shares(code, price, 1/3, "先賣 1/3")
         risk_tag = "（族群/大盤風險，門檻已下調）" if risk else ""
         msg = (f"{icon} {name}（{code}）{action}{risk_tag}\n"
                f"{context}"

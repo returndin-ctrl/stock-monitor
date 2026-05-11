@@ -183,6 +183,7 @@ def pf_buy(stock_code: str, stock_name: str, shares: int, price: float) -> dict:
     h["total_cost"] = h["total_cost"] + gross
     h["shares"]    += shares
     h["avg_cost"]   = h["total_cost"] / h["shares"]
+    h["last_buy_ts"] = time.time()
     data["holdings"][stock_code] = h
     data["cash"] -= total
     data["transactions"].append({
@@ -1387,9 +1388,18 @@ def check_stock(code: str, scfg: dict, intraday: dict, cfg: dict):
                       price=price, risk_flag=True, risk_reasons=risk_reasons,
                       message=f"buy_score={b_score} 達門檻但 risk=True 抑制")
 
+    # 冷靜期：剛買進 24h 內不推一般技術賣訊（停損 -5% 例外）
+    HOLD_GRACE_SEC = 86400
+    last_buy_ts = holding.get("last_buy_ts", 0) if has_position else 0
+    in_grace = last_buy_ts and (time.time() - last_buy_ts) < HOLD_GRACE_SEC
+
     if has_position and not scfg.get("no_sell_alert") and "error" not in sell_r and s_score >= eff_sell_thr and s_score > b_score:
         avg_cost = holding["avg_cost"]
         pnl_pct  = (price - avg_cost) / avg_cost * 100
+        # 冷靜期內跳過減碼/停利（但停損 -5% 不跳過，風險照警示）
+        if in_grace and pnl_pct > -5:
+            log.info(f"  {code} 冷靜期內跳過賣訊（pnl={pnl_pct:+.1f}%，距買進 {(time.time()-last_buy_ts)/3600:.1f}h）")
+            return
         if pnl_pct <= -5:
             icon, action = "🚨", "建議停損出場"
             sell_hint = _suggest_sell_shares(code, price, 1.0, "全數出場")
@@ -1725,6 +1735,7 @@ def api_import_holding():
         "shares": shares,
         "avg_cost": avg_cost,
         "total_cost": shares * avg_cost,
+        "last_buy_ts": float(d.get("last_buy_ts", time.time())),
     }
     _pf_save(data)
     return jsonify({"ok": True, "holdings": data["holdings"][code]})

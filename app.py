@@ -1343,9 +1343,6 @@ def check_stock(code: str, scfg: dict, intraday: dict, cfg: dict):
     # 風險旗標：抑制買訊、加強賣訊
     eff_buy_thr  = buy_thr  + (1 if risk  else 0)
     eff_sell_thr = sell_thr - (1 if risk  else 0)
-    # 族群同步噴出時，買訊門檻降 1（順勢）
-    if boost and not risk:
-        eff_buy_thr = max(buy_thr - 1, 3)
 
     holding      = _load()["holdings"].get(code, {})
     has_position = bool(holding)

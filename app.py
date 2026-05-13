@@ -27,6 +27,8 @@ DEFAULT_CONFIG = {
     "check_interval_minutes": 1,
     "buy_threshold": 5,
     "sell_threshold": 3,
+    "min_buy_gap": 3,
+    "min_sell_gap": 2,
     "initial_cash": 50000,
     "stocks": {
         "0050": {"name": "元大台灣50", "budget": 50000, "support_price": 70,   "resistance_price": 90,   "no_sell_alert": True},
@@ -1311,6 +1313,8 @@ def check_stock(code: str, scfg: dict, intraday: dict, cfg: dict):
     now_s    = datetime.now(TW_TZ).strftime("%Y/%m/%d %H:%M")
     buy_thr  = cfg.get("buy_threshold", 5)
     sell_thr = cfg.get("sell_threshold", 5)
+    min_buy_gap  = cfg.get("min_buy_gap", 3)
+    min_sell_gap = cfg.get("min_sell_gap", 2)
 
     log.info(f"  分析技術指標（{name} {code}）…")
     buy_r  = buy_analysis(code, price, scfg, intraday)
@@ -1372,8 +1376,9 @@ def check_stock(code: str, scfg: dict, intraday: dict, cfg: dict):
     sell_only = scfg.get("sell_only", False)
     last_sell_push = _notified.get(f"{code}_sell", 0)
     sell_recent = time.time() - last_sell_push < DIRECTION_COOLDOWN_SEC
+    buy_gap_ok = (b_score - s_score) >= min_buy_gap
     if (not sell_only and "error" not in buy_r and b_score >= eff_buy_thr
-            and b_score > s_score and not sell_recent):
+            and buy_gap_ok and not sell_recent):
         msg = (f"🟢 {name}（{code}）{buy_r['level']}\n"
                f"{context}"
                f"{_price_line(intraday)}\n"
@@ -1385,8 +1390,11 @@ def check_stock(code: str, scfg: dict, intraday: dict, cfg: dict):
                       price=price, risk_flag=False,
                       risk_reasons=risk_reasons, message=msg)
     elif (not sell_only and "error" not in buy_r and b_score >= eff_buy_thr
-            and b_score > s_score and sell_recent):
+            and buy_gap_ok and sell_recent):
         log.info(f"  {code} 24h 內已推過賣訊，跳過買訊（b_score={b_score}）")
+    elif (not sell_only and "error" not in buy_r and b_score >= eff_buy_thr
+            and not buy_gap_ok):
+        log.info(f"  {code} 訊號分歧，跳過買訊（b={b_score} s={s_score} gap<{min_buy_gap}）")
     elif not sell_only and "error" not in buy_r and b_score >= buy_thr and risk:
         # 達原始門檻但被 risk 抑制：仍記錄（但不推播）— 用於回測「有 risk 抑制 vs 沒抑制」對比
         record_signal(code, name, "buy_suppressed", score=b_score, threshold=buy_thr,
@@ -1398,7 +1406,11 @@ def check_stock(code: str, scfg: dict, intraday: dict, cfg: dict):
     last_buy_ts = holding.get("last_buy_ts", 0) if has_position else 0
     in_grace = last_buy_ts and (time.time() - last_buy_ts) < HOLD_GRACE_SEC
 
-    if has_position and not scfg.get("no_sell_alert") and "error" not in sell_r and s_score >= eff_sell_thr and s_score > b_score:
+    sell_gap_ok = (s_score - b_score) >= min_sell_gap
+    pnl_pct_cur = ((price - holding["avg_cost"]) / holding["avg_cost"] * 100) if has_position else 0
+    # 停損 -5% 例外：不受 gap 規則限制（風險管理優先）
+    bypass_gap = has_position and pnl_pct_cur <= -5
+    if has_position and not scfg.get("no_sell_alert") and "error" not in sell_r and s_score >= eff_sell_thr and (sell_gap_ok or bypass_gap):
         avg_cost = holding["avg_cost"]
         pnl_pct  = (price - avg_cost) / avg_cost * 100
         # 冷靜期內跳過減碼/停利（但停損 -5% 不跳過，風險照警示）

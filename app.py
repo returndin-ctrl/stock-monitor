@@ -682,6 +682,7 @@ def get_prices() -> dict:
 
 _notified: dict[str, float] = {}
 NOTIFY_COOLDOWN_SEC = 3600
+DIRECTION_COOLDOWN_SEC = 86400  # 同一檔 24h 內只推一個方向（停損 -5% 例外）
 
 # 監控執行緒狀態追蹤
 _monitor_status = {
@@ -1369,19 +1370,23 @@ def check_stock(code: str, scfg: dict, intraday: dict, cfg: dict):
 
     # 買訊：達（調整後）門檻、買分 > 賣分、且非風險狀態（sell_only 標的跳過買訊）
     sell_only = scfg.get("sell_only", False)
+    last_sell_push = _notified.get(f"{code}_sell", 0)
+    sell_recent = time.time() - last_sell_push < DIRECTION_COOLDOWN_SEC
     if (not sell_only and "error" not in buy_r and b_score >= eff_buy_thr
-            and b_score > s_score):
+            and b_score > s_score and not sell_recent):
         msg = (f"🟢 {name}（{code}）{buy_r['level']}\n"
                f"{context}"
                f"{_price_line(intraday)}\n"
                f"{decision_line(buy_r)}"
-               f"{_suggest_shares(code, scfg, price, cfg, b_score)}"
                f"{_holding_note(code, price)}\n"
                f"⏰ {now_s}")
         notify(f"{code}_buy", msg, f"買進訊號｜{name}", "high")
         record_signal(code, name, "buy", score=b_score, threshold=eff_buy_thr,
                       price=price, risk_flag=False,
                       risk_reasons=risk_reasons, message=msg)
+    elif (not sell_only and "error" not in buy_r and b_score >= eff_buy_thr
+            and b_score > s_score and sell_recent):
+        log.info(f"  {code} 24h 內已推過賣訊，跳過買訊（b_score={b_score}）")
     elif not sell_only and "error" not in buy_r and b_score >= buy_thr and risk:
         # 達原始門檻但被 risk 抑制：仍記錄（但不推播）— 用於回測「有 risk 抑制 vs 沒抑制」對比
         record_signal(code, name, "buy_suppressed", score=b_score, threshold=buy_thr,
@@ -1399,6 +1404,11 @@ def check_stock(code: str, scfg: dict, intraday: dict, cfg: dict):
         # 冷靜期內跳過減碼/停利（但停損 -5% 不跳過，風險照警示）
         if in_grace and pnl_pct > -5:
             log.info(f"  {code} 冷靜期內跳過賣訊（pnl={pnl_pct:+.1f}%，距買進 {(time.time()-last_buy_ts)/3600:.1f}h）")
+            return
+        # 方向鎖：24h 內已推過買訊就不推賣訊（停損 -5% 例外）
+        last_buy_push = _notified.get(f"{code}_buy", 0)
+        if time.time() - last_buy_push < DIRECTION_COOLDOWN_SEC and pnl_pct > -5:
+            log.info(f"  {code} 24h 內已推過買訊，跳過賣訊（pnl={pnl_pct:+.1f}%）")
             return
         if pnl_pct <= -5:
             icon, action = "🚨", "建議停損出場"
@@ -1611,7 +1621,7 @@ def run_check():
             lines.append(f"  {r['name']}({r['code']}) {r['shares']}股"
                          f" | 均{r['avg_cost']:,.0f} 現{r['price']}"
                          f" | {'▲' if r['pnl']>=0 else '▼'}{abs(r['pnl']):,.0f}元({r['pnl_pct']:+.1f}%)")
-        lines.append(f"  現金：{summary['cash']:,.0f}  總資產：{summary['total_assets']:,.0f}")
+        lines.append(f"  股票市值：{summary['stock_value']:,.0f}  未實現損益：{summary['unrealized']:+,.0f}")
         notify(f"portfolio_hourly_{now.hour}", "\n".join(lines), "持倉摘要")
 
 

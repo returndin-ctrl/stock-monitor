@@ -1346,8 +1346,8 @@ def check_stock(code: str, scfg: dict, intraday: dict, cfg: dict):
     if context:
         context += "\n"
 
-    # 風險旗標：抑制買訊、加強賣訊
-    eff_buy_thr  = buy_thr  + (1 if risk  else 0)
+    # 風險旗標：賣訊更敏感；買訊不再加碼（風險日往往就是超賣機會出現的時候）
+    eff_buy_thr  = buy_thr
     eff_sell_thr = sell_thr - (1 if risk  else 0)
 
     holding      = _load()["holdings"].get(code, {})

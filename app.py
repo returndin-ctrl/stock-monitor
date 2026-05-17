@@ -443,6 +443,22 @@ def _vol_ratio(volume: pd.Series) -> float:
     return float(volume.iloc[-1] / avg) if avg > 0 else 1.0
 
 
+def _breakout_signal(code: str, price: float) -> bool:
+    """順勢突破：收盤創前 20 日新高 + MA60 上彎 + 站上 MA60。
+    補回檔買訊的盲區——強勢續攻時 b-s 分歧閘門會把買訊閉嘴（3 年回測已驗證）。"""
+    df = _fetch_history(code, price)
+    if df is None or len(df) < 61:
+        return False
+    close, high = df["Close"], df["High"]
+    ma60 = close.rolling(60).mean()
+    if pd.isna(ma60.iloc[-1]) or pd.isna(ma60.iloc[-2]):
+        return False
+    hi20 = float(high.iloc[-21:-1].max())   # 前 20 日高點（不含今日）
+    return (price > hi20
+            and ma60.iloc[-1] > ma60.iloc[-2]
+            and price > float(ma60.iloc[-1]))
+
+
 def _build_result(signals: list, direction: str) -> dict:
     score     = sum(1 for _, b, _ in signals if b)
     max_score = len(signals)
@@ -1377,6 +1393,7 @@ def check_stock(code: str, scfg: dict, intraday: dict, cfg: dict):
     last_sell_push = _notified.get(f"{code}_sell", 0)
     sell_recent = time.time() - last_sell_push < DIRECTION_COOLDOWN_SEC
     buy_gap_ok = (b_score - s_score) >= min_buy_gap
+    buy_pushed = False
     if (not sell_only and "error" not in buy_r and b_score >= eff_buy_thr
             and buy_gap_ok and not sell_recent):
         msg = (f"🟢 {name}（{code}）{buy_r['level']}\n"
@@ -1389,6 +1406,7 @@ def check_stock(code: str, scfg: dict, intraday: dict, cfg: dict):
         record_signal(code, name, "buy", score=b_score, threshold=eff_buy_thr,
                       price=price, risk_flag=False,
                       risk_reasons=risk_reasons, message=msg)
+        buy_pushed = True
     elif (not sell_only and "error" not in buy_r and b_score >= eff_buy_thr
             and buy_gap_ok and sell_recent):
         log.info(f"  {code} 24h 內已推過賣訊，跳過買訊（b_score={b_score}）")
@@ -1400,6 +1418,20 @@ def check_stock(code: str, scfg: dict, intraday: dict, cfg: dict):
         record_signal(code, name, "buy_suppressed", score=b_score, threshold=buy_thr,
                       price=price, risk_flag=True, risk_reasons=risk_reasons,
                       message=f"buy_score={b_score} 達門檻但 risk=True 抑制")
+
+    # 趨勢突破買訊：繞過 b-s 分歧閘門，補強勢續攻盲區（3 年回測 2408 +385%→+441%）
+    if (not sell_only and not buy_pushed and not sell_recent
+            and _breakout_signal(code, price)):
+        msg = (f"🚀 {name}（{code}）突破買進（創 20 日新高、長線多頭續攻）\n"
+               f"{context}"
+               f"{_price_line(intraday)}\n"
+               f"突破前 20 日高點且站穩 MA60，順勢進場訊號\n"
+               f"{_holding_note(code, price)}\n"
+               f"⏰ {now_s}")
+        notify(f"{code}_buy", msg, f"突破買進｜{name}", "high")
+        record_signal(code, name, "buy", score=b_score, threshold=eff_buy_thr,
+                      price=price, risk_flag=False,
+                      risk_reasons=risk_reasons, message=msg)
 
     # 冷靜期：剛買進 24h 內不推一般技術賣訊（停損 -5% 例外）
     HOLD_GRACE_SEC = 86400

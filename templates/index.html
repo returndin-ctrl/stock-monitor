@@ -517,21 +517,14 @@ function calcBuyPreview(){
   const gross = shares * price;
   const fee   = Math.max(1, Math.round(gross * FEE_RATE));
   const total = gross + fee;
-  const cash  = _portfolio?.summary?.cash||0;
-  const ok    = total <= cash;
   el.style.display='block';
   el.innerHTML = `
     <div class="preview-row"><span class="m">股票成本</span><span>${fmt(gross)} 元</span></div>
     <div class="preview-row"><span class="m">手續費</span><span>${fmt(fee)} 元</span></div>
     <div class="preview-row total">
       <span>實際支出</span>
-      <span class="${ok?'g':'r'}">${fmt(total)} 元</span>
-    </div>
-    <div class="preview-row">
-      <span class="m">現金餘額</span>
-      <span class="${ok?'':'r'}">${fmt(cash)} 元 → ${fmt(cash-total)} 元</span>
-    </div>
-    ${!ok?'<div class="r" style="font-size:.8rem;margin-top:4px">⚠ 現金不足</div>':''}`;
+      <span>${fmt(total)} 元</span>
+    </div>`;
 }
 
 // ── 賣出預覽計算 ─────────────────────────────────────────────────────

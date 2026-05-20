@@ -771,27 +771,6 @@ def _price_line(intraday: dict) -> str:
     return f"現價 {price:,.0f}｜今日 {sign}{abs(cp):.1f}%{pos_s}{hl_s}"
 
 
-def _suggest_shares(code: str, scfg: dict, price: float, cfg: dict | None = None,
-                     score: int | None = None) -> str:
-    """依每檔 budget × 訊號強度比例算建議股數（不再追蹤剩餘現金）
-       score 4 → 50%、5 → 75%、≥6 → 100%"""
-    if price <= 0:
-        return ""
-    budget = scfg.get("budget", 50000)
-
-    if score is None or score >= 6:
-        fraction, label = 1.0, "全額（極強訊號）"
-    elif score == 5:
-        fraction, label = 0.75, "75%（強訊號）"
-    else:
-        fraction, label = 0.5, "50%（標準強訊號）"
-
-    shares = int((budget * fraction) // price)
-    if shares <= 0:
-        return f"\n📌 預算 {budget:,.0f} 元，買不到 1 股 @ {price:,.0f}"
-    return f"\n📌 建議買入：{shares} 股 — {label}：{shares*price:,.0f} 元 @ {price:,.0f}"
-
-
 def _suggest_sell_shares(code: str, price: float, fraction: float, hint: str = "") -> str:
     """依持倉 × 比例算出建議賣出股數"""
     h = _load()["holdings"].get(code, {})

@@ -176,8 +176,6 @@ def pf_buy(stock_code: str, stock_name: str, shares: int, price: float) -> dict:
     gross = shares * price
     fee   = _fee(gross, is_sell=False)
     total = gross + fee
-    if total > data["cash"]:
-        raise ValueError(f"現金不足！需要 {total:,.0f} 元，帳戶只有 {data['cash']:,.0f} 元")
     h = data["holdings"].get(stock_code, {
         "name": stock_name, "shares": 0, "avg_cost": 0.0, "total_cost": 0.0
     })
@@ -775,13 +773,11 @@ def _price_line(intraday: dict) -> str:
 
 def _suggest_shares(code: str, scfg: dict, price: float, cfg: dict | None = None,
                      score: int | None = None) -> str:
-    """依可用現金 × 訊號強度比例算建議股數
+    """依每檔 budget × 訊號強度比例算建議股數（不再追蹤剩餘現金）
        score 4 → 50%、5 → 75%、≥6 → 100%"""
     if price <= 0:
         return ""
-    cash = _load().get("cash", 0)
-    if cash <= 0:
-        return f"\n💰 現金不足（目前餘額 {cash:,.0f}）"
+    budget = scfg.get("budget", 50000)
 
     if score is None or score >= 6:
         fraction, label = 1.0, "全額（極強訊號）"
@@ -790,12 +786,10 @@ def _suggest_shares(code: str, scfg: dict, price: float, cfg: dict | None = None
     else:
         fraction, label = 0.5, "50%（標準強訊號）"
 
-    allocate = cash * fraction
-    shares = int(allocate // price)
+    shares = int((budget * fraction) // price)
     if shares <= 0:
-        return f"\n💰 可用現金 {cash:,.0f} 元，買不到 1 股 @ {price:,.0f}"
-    return (f"\n📌 建議買入：{shares} 股 — {label}：{shares*price:,.0f} 元 @ {price:,.0f}"
-            f"\n   可用現金 {cash:,.0f}")
+        return f"\n📌 預算 {budget:,.0f} 元，買不到 1 股 @ {price:,.0f}"
+    return f"\n📌 建議買入：{shares} 股 — {label}：{shares*price:,.0f} 元 @ {price:,.0f}"
 
 
 def _suggest_sell_shares(code: str, price: float, fraction: float, hint: str = "") -> str:

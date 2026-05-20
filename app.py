@@ -468,7 +468,7 @@ SIGNAL_WEIGHTS_BUY = {
     "成交量":     0.39,
     "價格位置":   0.29,
     "盤中走勢":   0.40,
-    "反轉K棒":    1.50,   # n=2 樣本太少，沿用文獻 hammer 估計
+    "反轉K棒":    0.39,   # n=25, 勝率 60%（門檻放寬到 -3% 後校正）
     "下影爆量":   0.40,   # n=29, 勝率 58.6%，最有效訊號
     "法人轉買":   0.80,   # 無 T86 歷史可回測，保守估計
     "突破":       0.54,   # n=338, 平均 +0.54%
@@ -599,7 +599,7 @@ def buy_analysis(code: str, price: float, scfg: dict, intraday: dict | None = No
             rng = h_ - l_
             lower_body = min(c_, o_) - l_
             shadow_ratio = lower_body / rng if rng > 0 else 0
-            bullish = (prev_change <= -7 and c_ >= o_ and shadow_ratio >= 0.5)
+            bullish = (prev_change <= -3 and c_ >= o_ and shadow_ratio >= 0.5)
             detail = (f"前日 {prev_change:+.1f}% + 今日下影 {shadow_ratio*100:.0f}% hammer ✦"
                       if bullish else f"非跌深反轉形態（前日 {prev_change:+.1f}%，下影 {shadow_ratio*100:.0f}%）")
             signals.append(("反轉K棒", bullish, detail))

@@ -77,7 +77,7 @@ def signal_triggers(df, scfg):
             prev_change = (close.iloc[i-1] - close.iloc[i-2]) / close.iloc[i-2] * 100
             rng = h_ - l_
             shadow = (min(c_, o_) - l_) / rng if rng > 0 else 0
-            trig["反轉K棒"] = (prev_change <= -7 and c_ >= o_ and shadow >= 0.5)
+            trig["反轉K棒"] = (prev_change <= -3 and c_ >= o_ and shadow >= 0.5)
         except Exception: trig["反轉K棒"] = False
         # 下影爆量
         try:

@@ -457,9 +457,32 @@ def _breakout_signal(code: str, price: float) -> bool:
             and price > float(ma60.iloc[-1]))
 
 
+# 每條訊號觸發時對應的隔日預期漲幅（%）權重
+# 由 backtest_weights.py 對 10 檔 × 2 年回測校正（2026-05-20）；
+# 反轉K棒/法人轉買 因樣本少或無歷史，用文獻保守估計值
+SIGNAL_WEIGHTS_BUY = {
+    "RSI":        0.12,
+    "KD":         0.21,
+    "MACD":       0.27,
+    "均線趨勢":   0.30,
+    "成交量":     0.39,
+    "價格位置":   0.29,
+    "盤中走勢":   0.40,
+    "反轉K棒":    1.50,   # n=2 樣本太少，沿用文獻 hammer 估計
+    "下影爆量":   0.40,   # n=29, 勝率 58.6%，最有效訊號
+    "法人轉買":   0.80,   # 無 T86 歷史可回測，保守估計
+    "突破":       0.54,   # n=338, 平均 +0.54%
+}
+
+
 def _build_result(signals: list, direction: str) -> dict:
     score     = sum(1 for _, b, _ in signals if b)
     max_score = len(signals)
+    # 加總觸發訊號的期望漲幅（買訊用，賣訊不計）
+    if direction == "buy":
+        exp_ret = sum(SIGNAL_WEIGHTS_BUY.get(name, 0.0) for name, b, _ in signals if b)
+    else:
+        exp_ret = 0.0
     if direction == "buy":
         if score >= 4:   level, icon = "強烈建議買進", "🟢🟢"
         elif score == 3: level, icon = "可考慮買進",  "🟢"
@@ -472,14 +495,17 @@ def _build_result(signals: list, direction: str) -> dict:
         else:            level, icon = "趨勢尚可，續抱",  "⚪"
     summary = f"{icon} {level}（{score}/{max_score} 指標{'看多' if direction=='buy' else '看空'}）"
     return {"signals": signals, "score": score, "max_score": max_score,
+            "exp_ret": exp_ret,
             "level": level, "level_icon": icon, "summary": summary, "direction": direction}
 
 
-def buy_analysis(code: str, price: float, scfg: dict, intraday: dict | None = None) -> dict:
+def buy_analysis(code: str, price: float, scfg: dict, intraday: dict | None = None,
+                 inst: dict | None = None) -> dict:
     df = _fetch_history(code, price)
     if df is None:
         return {"error": "無法取得歷史資料"}
     close, high, low, volume = df["Close"], df["High"], df["Low"], df["Volume"]
+    open_ = df["Open"]
     signals = []
 
     try:
@@ -560,6 +586,52 @@ def buy_analysis(code: str, price: float, scfg: dict, intraday: dict | None = No
                 detail  = f"今日 {cp:+.1f}%{f'，盤中位置 {pos:.0f}%' if pos is not None else ''}，無明顯超賣"
             signals.append(("盤中走勢", bullish, detail))
         except Exception: pass
+
+    # === 反轉/形態訊號（2026-05 新增，每條都自帶 SIGNAL_WEIGHTS_BUY 期望漲幅）===
+
+    # 反轉K棒：跌深 hammer（前日跌 ≥ 7% 且今日 close ≥ open 且下影 ≥ 50%）
+    try:
+        if len(close) >= 2:
+            prev_close_2d = float(close.iloc[-2])
+            prev_close_3d = float(close.iloc[-3]) if len(close) >= 3 else prev_close_2d
+            prev_change = (prev_close_2d - prev_close_3d) / prev_close_3d * 100 if prev_close_3d > 0 else 0
+            o_, c_, h_, l_ = float(open_.iloc[-1]), float(close.iloc[-1]), float(high.iloc[-1]), float(low.iloc[-1])
+            rng = h_ - l_
+            lower_body = min(c_, o_) - l_
+            shadow_ratio = lower_body / rng if rng > 0 else 0
+            bullish = (prev_change <= -7 and c_ >= o_ and shadow_ratio >= 0.5)
+            detail = (f"前日 {prev_change:+.1f}% + 今日下影 {shadow_ratio*100:.0f}% hammer ✦"
+                      if bullish else f"非跌深反轉形態（前日 {prev_change:+.1f}%，下影 {shadow_ratio*100:.0f}%）")
+            signals.append(("反轉K棒", bullish, detail))
+    except Exception: pass
+
+    # 下影爆量：下影 ≥ 50% + 量 ≥ 1.5x 20MA + 收紅或平
+    try:
+        o_, c_, h_, l_ = float(open_.iloc[-1]), float(close.iloc[-1]), float(high.iloc[-1]), float(low.iloc[-1])
+        rng = h_ - l_
+        lower_body = min(c_, o_) - l_
+        shadow_ratio = lower_body / rng if rng > 0 else 0
+        vr = _vol_ratio(volume)
+        bullish = (shadow_ratio >= 0.5 and vr >= 1.5 and c_ >= o_)
+        detail = (f"長下影 {shadow_ratio*100:.0f}% + 量 {vr:.1f}x + 收紅 ✦"
+                  if bullish else f"非下影爆量止跌（下影 {shadow_ratio*100:.0f}%，量 {vr:.1f}x）")
+        signals.append(("下影爆量", bullish, detail))
+    except Exception: pass
+
+    # 法人連賣轉買：過去連賣 ≥ 3 日，最近 1-2 日轉買
+    try:
+        if inst and inst.get("recent") and len(inst["recent"]) >= 4:
+            recent = inst["recent"]
+            earlier = recent[:-1]
+            earlier_sells = sum(1 for r in earlier if r["fii"] < 0)
+            latest_fii = recent[-1]["fii"]
+            bullish = (earlier_sells >= 3 and latest_fii > 0)
+            if bullish:
+                detail = f"外資前 {earlier_sells} 日連賣，昨日轉買 +{latest_fii/1000:,.0f}K ✦"
+            else:
+                detail = f"外資未呈現連賣轉買（前段賣 {earlier_sells} 日，昨 {latest_fii/1000:+,.0f}K）"
+            signals.append(("法人轉買", bullish, detail))
+    except Exception: pass
 
     return _build_result(signals, "buy")
 
@@ -660,6 +732,16 @@ def decision_line(result: dict) -> str:
         return f"⚠ {result['error']}\n"
     active = [name for name, b, _ in result["signals"] if b]
     return f"根據：{' + '.join(active[:3]) if active else '無明顯訊號'}\n"
+
+
+def exp_ret_line(result: dict, extra_pct: float = 0.0) -> str:
+    """買訊期望隔日漲幅一行；extra_pct 給突破訊號等不在 result 裡的訊號補權重"""
+    if "error" in result:
+        return ""
+    pct = result.get("exp_ret", 0.0) + extra_pct
+    if pct <= 0:
+        return ""
+    return f"📈 期望明日 {pct:+.1f}%\n"
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1306,17 +1388,18 @@ def check_stock(code: str, scfg: dict, intraday: dict, cfg: dict):
     min_sell_gap = cfg.get("min_sell_gap", 2)
 
     log.info(f"  分析技術指標（{name} {code}）…")
-    buy_r  = buy_analysis(code, price, scfg, intraday)
+    # 先抓 inst 給 buy_analysis 用（法人轉買訊號要）
+    inst      = get_inst_pulse(code)
+    buy_r  = buy_analysis(code, price, scfg, intraday, inst=inst)
     sell_r = sell_analysis(code, price, scfg, intraday)
 
-    # 族群 + 新聞 + 大盤 + 美股隔夜 + 法說會 + 三大法人籌碼（皆有 cache）
+    # 族群 + 新聞 + 大盤 + 美股隔夜 + 法說會（皆有 cache）
     peer_grp  = scfg.get("peer_group")  # None 則不查族群
     pulse     = get_peer_pulse(peer_grp) if peer_grp else None
     news      = scan_news(code, name)
     market    = get_market_pulse()
     overnight = get_overnight_us()
     event     = get_event_window(code)
-    inst      = get_inst_pulse(code)
     in_event  = event is not None
     peer_down = pulse is not None and pulse["alarm_down"]
     peer_up   = pulse is not None and pulse["alarm_up"]
@@ -1373,6 +1456,7 @@ def check_stock(code: str, scfg: dict, intraday: dict, cfg: dict):
                f"{context}"
                f"{_price_line(intraday)}\n"
                f"{decision_line(buy_r)}"
+               f"{exp_ret_line(buy_r)}"
                f"{_holding_note(code, price)}\n"
                f"⏰ {now_s}")
         notify(f"{code}_buy", msg, f"買進訊號｜{name}", "high")
@@ -1395,10 +1479,12 @@ def check_stock(code: str, scfg: dict, intraday: dict, cfg: dict):
     # 趨勢突破買訊：繞過 b-s 分歧閘門，補強勢續攻盲區（3 年回測 2408 +385%→+441%）
     if (not sell_only and not buy_pushed and not sell_recent
             and _breakout_signal(code, price)):
+        breakout_w = SIGNAL_WEIGHTS_BUY.get("突破", 2.0)
         msg = (f"🚀 {name}（{code}）突破買進（創 20 日新高、長線多頭續攻）\n"
                f"{context}"
                f"{_price_line(intraday)}\n"
                f"突破前 20 日高點且站穩 MA60，順勢進場訊號\n"
+               f"{exp_ret_line(buy_r, extra_pct=breakout_w)}"
                f"{_holding_note(code, price)}\n"
                f"⏰ {now_s}")
         notify(f"{code}_buy", msg, f"突破買進｜{name}", "high")
